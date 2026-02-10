@@ -1,6 +1,8 @@
 import json
 import boto3
+from typing import List
 from app.core.config import MODEL_ID, AWS_REGION
+from app.schemas.chat import Message
 
 class BedrockLLMService:
     def __init__(self):
@@ -9,17 +11,27 @@ class BedrockLLMService:
             region_name=AWS_REGION
         )
 
-    def chat(self, prompt: str, history=None) -> str:
+    def chat(self, prompt: str, history: List[Message]) -> str:
+        messages = []
+
+        # 把历史对话塞进 Claude
+        for msg in history:
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+
+        # 当前用户输入
+        messages.append({
+            "role": "user",
+            "content": prompt
+        })
+
         body = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 512,
             "temperature": 0.7,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+            "messages": messages
         }
 
         response = self.client.invoke_model(
