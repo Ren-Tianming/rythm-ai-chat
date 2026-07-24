@@ -1,8 +1,8 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -52,7 +52,11 @@ class Settings(BaseSettings):
     smtp_from_email: str = "noreply@example.com"
     smtp_use_tls: bool = True
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    # Accept the comma-separated value used by .env.example. NoDecode prevents
+    # pydantic-settings from requiring JSON before our validator can split it.
+    cors_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:5173"]
+    )
 
     @field_validator("cors_origins", mode="before")
     @classmethod
