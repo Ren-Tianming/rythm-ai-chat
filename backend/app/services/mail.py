@@ -10,6 +10,14 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 
+def build_account_action_url(action: str, token: str, settings: Settings) -> str:
+    """Keep one-time tokens in the URL fragment so they are never sent in HTTP requests."""
+    if action not in {"verify", "reset"}:
+        raise ValueError("Unsupported account action")
+    base_url = settings.frontend_url.rstrip("/")
+    return f"{base_url}/#{action}={quote(token, safe='')}"
+
+
 def _send_sync(message: EmailMessage, settings: Settings) -> None:
     with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as client:
         if settings.smtp_use_tls:
@@ -34,10 +42,10 @@ async def send_email(to_email: str, subject: str, body: str, settings: Settings)
 
 
 async def send_verification_email(to_email: str, token: str, settings: Settings) -> None:
-    url = f"{settings.frontend_url}/?verify={quote(token)}"
+    url = build_account_action_url("verify", token, settings)
     await send_email(to_email, "Verify your RyThM Chatbot account", f"Verify: {url}", settings)
 
 
 async def send_reset_email(to_email: str, token: str, settings: Settings) -> None:
-    url = f"{settings.frontend_url}/?reset={quote(token)}"
+    url = build_account_action_url("reset", token, settings)
     await send_email(to_email, "Reset your RyThM Chatbot password", f"Reset: {url}", settings)

@@ -2,6 +2,21 @@ services:
   db:
     image: postgres:17-alpine
     restart: unless-stopped
+    mem_limit: 768m
+    cpus: 0.75
+    shm_size: 64m
+    command:
+      - postgres
+      - -c
+      - max_connections=30
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=64MB
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-rythm_chatbot}
       POSTGRES_USER: ${POSTGRES_USER:-rythm}
@@ -14,25 +29,34 @@ services:
       timeout: 3s
       retries: 10
     networks: [internal]
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    env_file: .env
+    mem_limit: 512m
+    cpus: 0.75
+    env_file: ${ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rythm}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-rythm_chatbot}
       FORWARDED_ALLOW_IPS: 172.16.0.0/12
+      WEB_CONCURRENCY: "1"
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready')"]
       interval: 15s
       timeout: 5s
       retries: 5
     networks: [internal]
+    logging: *default-logging
 
   web:
     build:
@@ -40,13 +64,17 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         VITE_TURNSTILE_SITE_KEY: ${VITE_TURNSTILE_SITE_KEY:-}
+        VITE_TERMS_VERSION: ${VITE_TERMS_VERSION:-2026-07-29}
     restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
     ports:
-      - "${HTTP_PORT:-80}:80"
+      - "127.0.0.1:${CHATBOT_PORT:-8081}:80"
     depends_on:
       backend:
         condition: service_healthy
     networks: [internal]
+    logging: *default-logging
 
 networks:
   internal:

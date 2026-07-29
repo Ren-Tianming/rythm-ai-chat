@@ -19,7 +19,7 @@ class ConversationCreate(BaseModel):
 
 
 class ConversationUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=160)
+    title: str | None = Field(default=None, min_length=1, max_length=100)
     model_profile_id: uuid.UUID | None = None
     archived: bool | None = None
 
@@ -35,6 +35,8 @@ class ConversationResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
+    model_profile_id: uuid.UUID | None = None
+    client_request_id: uuid.UUID
 
 
 class ChatMessageResponse(BaseModel):

@@ -21,10 +21,18 @@ class ProviderEvent:
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, code: str, message: str, status_code: int = 502):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 503,
+        *,
+        retryable: bool = False,
+    ):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.retryable = retryable
 
 
 class BaseLLMProvider:
@@ -33,6 +41,9 @@ class BaseLLMProvider:
     ) -> AsyncIterator[ProviderEvent]:
         raise NotImplementedError
 
+    async def aclose(self) -> None:
+        return None
+
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     def __init__(self, *, api_key: str, base_url: str, timeout: float, provider: str):
@@ -40,12 +51,16 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.provider = provider
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
 
     async def stream(
         self, messages: list[LLMMessage], model_id: str, max_tokens: int
     ) -> AsyncIterator[ProviderEvent]:
         if not self.api_key:
-            raise ProviderError("provider_not_configured", f"{self.provider} API key is missing", 503)
+            raise ProviderError("MODEL_NOT_CONFIGURED", "The selected model is not configured")
         payload = {
             "model": model_id,
             "messages": [{"role": message.role, "content": message.content} for message in messages],
@@ -56,14 +71,30 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream(
+            async with self.client.stream(
                     "POST", f"{self.base_url}/chat/completions", json=payload, headers=headers
                 ) as response:
                     if response.status_code >= 400:
-                        body = (await response.aread()).decode("utf-8", errors="replace")[:500]
-                        code = "provider_rate_limited" if response.status_code == 429 else "provider_error"
-                        raise ProviderError(code, f"{self.provider} returned {response.status_code}: {body}")
+                        await response.aread()
+                        if response.status_code == 429:
+                            raise ProviderError(
+                                "MODEL_RATE_LIMITED",
+                                "The model is temporarily rate limited",
+                                retryable=True,
+                            )
+                        if response.status_code in {401, 403}:
+                            raise ProviderError(
+                                "MODEL_AUTH_FAILED", "The model is temporarily unavailable"
+                            )
+                        if response.status_code == 404:
+                            raise ProviderError(
+                                "MODEL_NOT_FOUND", "The selected model is unavailable"
+                            )
+                        raise ProviderError(
+                            "MODEL_UPSTREAM_ERROR",
+                            "The model service returned an error",
+                            retryable=response.status_code >= 500,
+                        )
                     request_id = response.headers.get("x-request-id")
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
@@ -86,6 +117,13 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                             request_id=request_id or item.get("id"),
                         )
         except httpx.TimeoutException as exc:
-            raise ProviderError("provider_timeout", f"{self.provider} timed out", 504) from exc
+            raise ProviderError(
+                "MODEL_TIMEOUT", "The model response timed out", 504, retryable=True
+            ) from exc
         except httpx.HTTPError as exc:
-            raise ProviderError("provider_unavailable", f"{self.provider} is unavailable") from exc
+            raise ProviderError(
+                "MODEL_UPSTREAM_ERROR", "The model service is unavailable", retryable=True
+            ) from exc
+
+    async def aclose(self) -> None:
+        await self.client.aclose()

@@ -1,0 +1,11 @@
+[Unit]
+Description=RyThM Chatbot PostgreSQL backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=RYTHM_PROJECT_DIR=/opt/rythm-chatbot
+Environment=RYTHM_ENV_FILE=/opt/rythm-chatbot/.env
+Environment=RYTHM_BACKUP_DIR=/var/backups/rythm-chatbot
+ExecStart=/opt/rythm-chatbot/deploy/backup.sh

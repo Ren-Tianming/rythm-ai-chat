@@ -1,4 +1,4 @@
-export type Locale = 'zh' | 'ja' | 'en'
+export type Locale = 'zh-CN' | 'ja-JP' | 'en-US'
 
 export interface User {
   id: string

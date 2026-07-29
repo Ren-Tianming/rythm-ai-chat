@@ -1,7 +1,8 @@
 from functools import lru_cache
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
 
     app_name: str = "RyThM Chatbot"
     environment: Literal["development", "test", "production"] = "development"
+    app_secret: str = "development-only-change-me"
     api_v1_prefix: str = "/api/v1"
     frontend_url: str = "http://localhost:5173"
     database_url: str = "postgresql+asyncpg://rythm:rythm@db:5432/rythm_chatbot"
@@ -25,10 +27,14 @@ class Settings(BaseSettings):
     session_absolute_days: int = 14
     cookie_secure: bool = False
 
-    max_input_chars: int = 4000
-    max_output_tokens: int = 512
-    context_rounds: int = 5
-    daily_chat_limit: int = 50
+    max_input_chars: int = Field(default=4000, ge=1, le=16000)
+    max_context_chars: int = Field(default=16000, ge=4000, le=100000)
+    max_output_tokens: int = Field(default=512, ge=1, le=1024)
+    context_rounds: int = Field(default=5, ge=1, le=5)
+    daily_chat_limit: int = Field(default=50, ge=1, le=10000)
+    chat_per_minute_limit: int = Field(default=5, ge=1, le=100)
+    max_concurrent_generations_per_user: int = Field(default=1, ge=1, le=10)
+    generation_timeout_seconds: float = Field(default=120.0, ge=30.0, le=600.0)
     provider_timeout_seconds: float = 60.0
     system_prompt: str = (
         "You are RyThM Chatbot, a concise, accurate multilingual assistant. "
@@ -37,13 +43,17 @@ class Settings(BaseSettings):
 
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = ""
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_model: str = ""
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_model: str = ""
 
     turnstile_secret_key: str = ""
     turnstile_required: bool = False
+    terms_version: str = "2026-07-29"
 
     smtp_host: str = ""
     smtp_port: int = 587
@@ -51,23 +61,72 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from_email: str = "noreply@example.com"
     smtp_use_tls: bool = True
+    log_level: str = "INFO"
 
     # Accept the comma-separated value used by .env.example. NoDecode prevents
     # pydantic-settings from requiring JSON before our validator can split it.
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
     )
+    trusted_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["localhost", "127.0.0.1", "testserver"]
+    )
+    csrf_trusted_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:5173"]
+    )
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "trusted_hosts", "csrf_trusted_origins", mode="before")
     @classmethod
-    def parse_origins(cls, value: object) -> object:
+    def parse_csv(cls, value: object) -> object:
         if isinstance(value, str) and not value.startswith("["):
-            return [origin.strip() for origin in value.split(",") if origin.strip()]
+            return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, value: str) -> str:
+        normalized = value.upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("Unsupported LOG_LEVEL")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_production_safety(self) -> "Settings":
+        if not self.is_production:
+            return self
+        errors: list[str] = []
+        if len(self.app_secret) < 32 or self.app_secret == "development-only-change-me":
+            errors.append("APP_SECRET must be a unique value of at least 32 characters")
+        if not self.cookie_secure:
+            errors.append("COOKIE_SECURE must be true")
+        if urlparse(self.frontend_url).scheme != "https":
+            errors.append("FRONTEND_URL must use https")
+        if not self.turnstile_required or not self.turnstile_secret_key:
+            errors.append("Turnstile must be required and configured")
+        if not self.smtp_host:
+            errors.append("SMTP_HOST must be configured")
+        if not self.database_url or "rythm:rythm@" in self.database_url:
+            errors.append("DATABASE_URL must use production credentials")
+        if "*" in self.trusted_hosts:
+            errors.append("TRUSTED_HOSTS must not contain a wildcard")
+        providers = (
+            (self.deepseek_api_key, self.deepseek_model),
+            (self.gemini_api_key, self.gemini_model),
+            (self.groq_api_key, self.groq_model),
+        )
+        if not any(key and model for key, model in providers):
+            errors.append("At least one provider API key and model ID must be configured")
+        if errors:
+            raise ValueError("Unsafe production configuration: " + "; ".join(errors))
+        return self
 
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def allowed_csrf_origins(self) -> set[str]:
+        return {self.frontend_url.rstrip("/"), *(item.rstrip("/") for item in self.csrf_trusted_origins)}
 
 
 @lru_cache

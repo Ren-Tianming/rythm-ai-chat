@@ -9,6 +9,8 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -43,8 +45,8 @@ class User(Base, TimestampMixin):
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     normalized_email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
-    display_name: Mapped[str | None] = mapped_column(String(80))
-    locale: Mapped[str] = mapped_column(String(8), default="zh", nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(50))
+    locale: Mapped[str] = mapped_column(String(10), default="zh-CN", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending_verification", nullable=False)
     role: Mapped[str] = mapped_column(String(16), default="user", nullable=False)
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -67,6 +69,9 @@ class AuthSession(Base):
     ip_address: Mapped[str | None] = mapped_column(String(64))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    idle_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    absolute_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -100,6 +105,14 @@ class ModelProfile(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     max_output_tokens: Mapped[int] = mapped_column(Integer, default=512, nullable=False)
+    display_name_i18n: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    context_rounds: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    default_output_tokens: Mapped[int] = mapped_column(Integer, default=512, nullable=False)
+    input_price_per_million: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    output_price_per_million: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    pricing_version: Mapped[str | None] = mapped_column(String(40))
+    config_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class Conversation(Base, TimestampMixin):
@@ -109,7 +122,7 @@ class Conversation(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     model_profile_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("model_profiles.id"))
-    title: Mapped[str] = mapped_column(String(160), default="New conversation", nullable=False)
+    title: Mapped[str] = mapped_column(String(100), default="New conversation", nullable=False)
     archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -142,20 +155,32 @@ class Message(Base):
 
 class Generation(Base):
     __tablename__ = "generations"
-    __table_args__ = (CheckConstraint("status IN ('pending','streaming','completed','failed','cancelled')"),)
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','streaming','completed','failed','cancelled')"),
+        UniqueConstraint("user_id", "client_request_id"),
+        Index("ix_generations_conversation_created", "conversation_id", "created_at"),
+        Index("ix_generations_conversation_status", "conversation_id", "status"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE")
     )
-    user_message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"))
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    client_request_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    user_message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), unique=True)
     assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
     model_profile_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("model_profiles.id"))
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     provider_request_id: Mapped[str | None] = mapped_column(String(200))
     error_code: Mapped[str | None] = mapped_column(String(80))
+    error_detail_redacted: Mapped[str | None] = mapped_column(String(500))
+    context_truncated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
 
 
 class UsageEvent(Base):
@@ -169,7 +194,9 @@ class UsageEvent(Base):
     model_id: Mapped[str] = mapped_column(String(160), nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     estimated_cost_microusd: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    pricing_version: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -180,7 +207,26 @@ class AuditLog(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
     user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_type: Mapped[str | None] = mapped_column(String(80))
+    target_id: Mapped[str | None] = mapped_column(String(100))
+    result: Mapped[str] = mapped_column(String(32), default="success", nullable=False)
     ip_address: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(512))
+    request_id: Mapped[str | None] = mapped_column(String(80))
     details: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class UserConsent(Base):
+    __tablename__ = "user_consents"
+    __table_args__ = (
+        UniqueConstraint("user_id", "document_type", "document_version"),
+        Index("ix_user_consents_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    document_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    document_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    ip_address: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

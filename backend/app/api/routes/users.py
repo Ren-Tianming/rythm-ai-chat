@@ -1,13 +1,25 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentAuth, require_csrf
+from app.api.deps import CurrentAuth, get_current_auth, require_csrf
 from app.db.session import get_db
 from app.schemas.auth import UserResponse
 from app.schemas.user import UserUpdate
 
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_me(auth: CurrentAuth = Depends(get_current_auth)) -> UserResponse:
+    return UserResponse(
+        id=auth.user.id,
+        email=auth.user.email,
+        display_name=auth.user.display_name,
+        locale=auth.user.locale,
+        role=auth.user.role,
+        email_verified=auth.user.email_verified_at is not None,
+    )
 
 
 @router.patch("/me", response_model=UserResponse)

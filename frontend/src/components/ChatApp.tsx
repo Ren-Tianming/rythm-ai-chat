@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Bot, ChevronDown, LogOut, Menu, MessageSquarePlus, Send, Settings, Sparkles, Square, Trash2, UserRound, X } from 'lucide-react'
+import { Archive, Bot, ChevronDown, Edit3, LogOut, Menu, MessageSquarePlus, Search, Send, Settings, Sparkles, Square, Trash2, UserRound, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -27,16 +27,20 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
   const [usage, setUsage] = useState<UsageSummary | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [archivedView, setArchivedView] = useState(false)
+  const [search, setSearch] = useState('')
   const abortRef = useRef<AbortController | null>(null)
+  const generationIdRef = useRef<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
 
-  const loadConversations = async () => setConversations(await api.conversations())
+  const loadConversations = async () => setConversations(await api.conversations(archivedView))
   useEffect(() => {
-    void Promise.all([api.models(), api.conversations(), api.usage()]).then(([modelList, chatList, summary]) => {
+    void Promise.all([api.models(), api.conversations(false), api.usage()]).then(([modelList, chatList, summary]) => {
       setModels(modelList); setConversations(chatList); setUsage(summary)
       setSelectedModel(modelList.find((item) => item.is_default)?.id || modelList[0]?.id || '')
     }).catch((reason: Error) => setError(reason.message))
   }, [])
+  useEffect(() => { void api.conversations(archivedView).then(setConversations).catch((reason: Error) => setError(reason.message)) }, [archivedView])
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
   const activeModel = useMemo(() => models.find((item) => item.id === (active?.model_profile_id || selectedModel)), [models, active, selectedModel])
@@ -65,6 +69,20 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     if (active?.id === conversation.id) newConversation()
   }
 
+  const archiveConversation = async (conversation: Conversation) => {
+    await api.updateConversation(conversation.id, { archived: !conversation.archived })
+    setConversations((list) => list.filter((item) => item.id !== conversation.id))
+    if (active?.id === conversation.id) newConversation()
+  }
+
+  const renameConversation = async (conversation: Conversation) => {
+    const title = window.prompt(t('rename'), conversation.title)?.trim()
+    if (!title) return
+    const updated = await api.updateConversation(conversation.id, { title })
+    setConversations((list) => list.map((item) => item.id === updated.id ? updated : item))
+    if (active?.id === updated.id) setActive(updated)
+  }
+
   const submit = async (event?: FormEvent) => {
     event?.preventDefault()
     const content = input.trim()
@@ -81,8 +99,10 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
       const assistantMessage: ChatMessage = { ...userMessage, id: assistantId, sequence_no: userMessage.sequence_no + 1, role: 'assistant', content: '', status: 'streaming', model_profile_id: selectedModel }
       setMessages((list) => [...list, userMessage, assistantMessage])
       const controller = new AbortController(); abortRef.current = controller
+      const clientRequestId = crypto.randomUUID()
       let streamError = ''
-      await streamChat(conversation.id, content, controller.signal, {
+      await streamChat(conversation.id, content, clientRequestId, selectedModel, controller.signal, {
+        onMetadata: (data) => { generationIdRef.current = String(data.generation_id || '') || null },
         onDelta: (text) => setMessages((list) => list.map((item) => item.id === assistantId ? { ...item, content: item.content + text } : item)),
         onError: (message) => { streamError = message },
       })
@@ -92,7 +112,15 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     } catch (reason) {
       if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : t('error'))
       if (conversation) void api.messages(conversation.id).then(setMessages)
-    } finally { setStreaming(false); abortRef.current = null }
+    } finally { setStreaming(false); abortRef.current = null; generationIdRef.current = null }
+  }
+
+  const stopGeneration = async () => {
+    const generationId = generationIdRef.current
+    if (generationId) {
+      try { await api.cancelGeneration(generationId) } catch { /* Disconnect still cancels. */ }
+    }
+    abortRef.current?.abort()
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -105,10 +133,13 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     <aside className={`sidebar ${sidebarOpen ? 'sidebar--open' : ''}`}>
       <div className="sidebar__top"><Brand compact /><button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)}><X /></button></div>
       <button className="new-chat" onClick={newConversation}><MessageSquarePlus size={19} /><span>{t('newChat')}</span><kbd>⌘ K</kbd></button>
+      <div className="conversation-tools"><label><Search size={14} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t('searchConversations')} /></label><button className={archivedView ? 'active' : ''} onClick={() => setArchivedView((value) => !value)}><Archive size={15} />{t(archivedView ? 'activeChats' : 'archived')}</button></div>
       <div className="sidebar__label">{t('conversations')}<span>{conversations.length}</span></div>
-      <nav className="conversation-list">{conversations.length === 0 && <p>{t('noConversations')}</p>}{conversations.map((conversation) => (
+      <nav className="conversation-list">{conversations.length === 0 && <p>{t('noConversations')}</p>}{conversations.filter((conversation) => conversation.title.toLocaleLowerCase().includes(search.toLocaleLowerCase())).map((conversation) => (
         <div className={`conversation-item ${active?.id === conversation.id ? 'active' : ''}`} key={conversation.id}>
           <button onClick={() => void openConversation(conversation)}><span className="conversation-dot" /><span>{conversation.title}</span></button>
+          <button className="conversation-action" title={t('rename')} onClick={() => void renameConversation(conversation)}><Edit3 size={14} /></button>
+          <button className="conversation-action" title={t(conversation.archived ? 'restore' : 'archive')} onClick={() => void archiveConversation(conversation)}><Archive size={14} /></button>
           <button className="conversation-delete" title={t('delete')} onClick={() => void deleteConversation(conversation)}><Trash2 size={15} /></button>
         </div>
       ))}</nav>
@@ -117,13 +148,13 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     </aside>
     {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />}
     <main className="chat-main">
-      <header className="chat-header"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu /></button><div className="model-select"><span><Sparkles size={15} />{t('model')}</span><select value={active?.model_profile_id || selectedModel} onChange={(e) => void chooseModel(e.target.value)}>{models.map((model) => <option value={model.id} key={model.id}>{model.display_name}</option>)}</select><ChevronDown size={16} /></div><div className="header-actions"><span className="secure-indicator"><i /> Context · 5</span><LanguagePicker onChange={(locale) => onUserChange({ ...user, locale })} /></div></header>
+      <header className="chat-header"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu /></button><div className="chat-title">{active?.title}</div><div className="model-select"><span><Sparkles size={15} />{t('model')}</span><select value={active?.model_profile_id || selectedModel} onChange={(e) => void chooseModel(e.target.value)}>{models.map((model) => <option value={model.id} key={model.id}>{model.display_name}</option>)}</select><ChevronDown size={16} /></div><div className="header-actions"><span className="secure-indicator"><i /> {t('contextLabel')}</span><LanguagePicker onChange={(locale) => void api.updateMe({ locale }).then(onUserChange).catch(() => onUserChange({ ...user, locale }))} /></div></header>
       <section className="messages"><div className="messages__inner">{messages.length === 0 ? (
-        <motion.div className="empty-chat" initial={{ opacity: 0, scale: .98 }} animate={{ opacity: 1, scale: 1 }}><div className="empty-chat__logo"><img src="/rythm-logo.png" alt="" /></div><h1>{t('welcome')}</h1><p>{t('welcomeHint')}</p><div className="model-cards">{models.map((model) => <button key={model.id} className={selectedModel === model.id ? 'active' : ''} onClick={() => void chooseModel(model.id)}><span>{model.provider.slice(0, 1).toUpperCase()}</span><div><strong>{model.display_name}</strong><small>{t(model.description_key)}</small></div></button>)}</div></motion.div>
+        <motion.div className="empty-chat" initial={{ opacity: 0, scale: .98 }} animate={{ opacity: 1, scale: 1 }}><div className="empty-chat__logo"><img src="/rythm-logo.png" alt="" /></div><h1>{t('welcome')}</h1><p>{t('welcomeHint')}</p><div className="example-prompts">{['example1', 'example2', 'example3'].map((key) => <button key={key} onClick={() => setInput(t(key))}>{t(key)}</button>)}</div><div className="model-cards">{models.map((model) => <button key={model.id} className={selectedModel === model.id ? 'active' : ''} onClick={() => void chooseModel(model.id)}><span>{model.provider.slice(0, 1).toUpperCase()}</span><div><strong>{model.display_name}</strong><small>{t(model.description_key)}</small></div></button>)}</div></motion.div>
       ) : messages.map((message) => (
-        <motion.article className={`message message--${message.role}`} key={message.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><div className="message__avatar">{message.role === 'assistant' ? <Bot size={20} /> : <UserRound size={20} />}</div><div className="message__body"><header><strong>{message.role === 'assistant' ? 'RyThM' : (user.display_name || 'You')}</strong>{message.role === 'assistant' && <span>{models.find((m) => m.id === message.model_profile_id)?.display_name || activeModel?.display_name}</span>}</header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content || (streaming ? '● ● ●' : '')}</ReactMarkdown></div>{message.output_tokens !== null && <small className="token-meta">{message.output_tokens} output tokens</small>}</div></motion.article>
+        <motion.article className={`message message--${message.role}`} key={message.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><div className="message__avatar">{message.role === 'assistant' ? <Bot size={20} /> : <UserRound size={20} />}</div><div className="message__body"><header><strong>{message.role === 'assistant' ? 'RyThM' : (user.display_name || t('you'))}</strong>{message.role === 'assistant' && <span>{models.find((m) => m.id === message.model_profile_id)?.display_name || activeModel?.display_name}</span>}</header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (props) => <a {...props} rel="noopener noreferrer" target="_blank" /> }}>{message.content || (streaming ? '● ● ●' : '')}</ReactMarkdown></div>{message.output_tokens !== null && <small className="token-meta">{message.output_tokens} {t('outputTokens')}</small>}</div></motion.article>
       ))}<div ref={endRef} />{error && <div className="notice notice--error chat-error">{error}</div>}</div></section>
-      <footer className="composer-wrap"><form className="composer" onSubmit={(e) => void submit(e)}><textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKeyDown} placeholder={t('placeholder')} maxLength={4000} rows={1} disabled={streaming} /><div className="composer__bottom"><span>{input.length}/4000 · {activeModel?.display_name}</span>{streaming ? <button type="button" className="send-button stop" onClick={() => abortRef.current?.abort()} title={t('stop')}><Square size={17} /></button> : <button className="send-button" disabled={!input.trim() || !selectedModel} title={t('send')}><Send size={18} /></button>}</div></form><p>{t('providerNotice')}</p></footer>
+      <footer className="composer-wrap"><form className="composer" onSubmit={(e) => void submit(e)}><textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKeyDown} placeholder={t('placeholder')} maxLength={4000} rows={1} disabled={streaming} /><div className="composer__bottom"><span>{input.length}/4000 · {activeModel?.display_name}</span>{streaming ? <button type="button" className="send-button stop" onClick={() => void stopGeneration()} title={t('stop')}><Square size={17} /></button> : <button className="send-button" disabled={!input.trim() || !selectedModel} title={t('send')}><Send size={18} /></button>}</div></form><p>{t('providerNotice')}</p></footer>
     </main>
     <SettingsModal open={settingsOpen} user={user} onClose={() => setSettingsOpen(false)} onUserChange={onUserChange} />
   </div>

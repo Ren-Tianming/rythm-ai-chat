@@ -10,6 +10,7 @@ from app.db.models import (
     PasswordResetToken,
     UsageEvent,
     User,
+    UserConsent,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "PasswordResetToken",
     "UsageEvent",
     "User",
+    "UserConsent",
 ]

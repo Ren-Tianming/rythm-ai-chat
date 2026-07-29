@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
-from sqlalchemy import delete, select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentAuth, get_current_auth, require_csrf
@@ -20,6 +20,7 @@ from app.db.models import (
     EmailVerificationToken,
     PasswordResetToken,
     User,
+    UserConsent,
 )
 from app.db.session import get_db
 from app.schemas.auth import (
@@ -34,7 +35,7 @@ from app.schemas.auth import (
     UserResponse,
     VerifyEmailRequest,
 )
-from app.services.anti_abuse import verify_turnstile
+from app.services.anti_abuse import rate_limiter, verify_turnstile
 from app.services.mail import send_reset_email, send_verification_email
 
 
@@ -61,6 +62,11 @@ def client_ip(request: Request) -> str | None:
     if forwarded:
         return forwarded.split(",", 1)[0].strip()
     return request.client.host if request.client else None
+
+
+def default_display_name(email: str) -> str:
+    candidate = "".join(char for char in email.split("@", 1)[0].strip() if char.isprintable())
+    return (candidate or "User")[:50]
 
 
 def set_auth_cookies(response: Response, session_token: str, csrf_token: str, settings: Settings) -> None:
@@ -93,7 +99,14 @@ async def register(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
+    remote_ip = client_ip(request) or "unknown"
+    await rate_limiter.check(f"register:ip:{remote_ip}", 5, 3600)
     await verify_turnstile(payload.turnstile_token, client_ip(request), settings)
+    if payload.terms_version != settings.terms_version:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "CONSENT_REQUIRED", "message": "The terms version is not current"},
+        )
     normalized = normalized_email(str(payload.email))
     existing = await db.scalar(select(User).where(User.normalized_email == normalized))
     if existing:
@@ -102,7 +115,7 @@ async def register(
         email=str(payload.email),
         normalized_email=normalized,
         password_hash=hash_password(payload.password),
-        display_name=payload.display_name,
+        display_name=payload.display_name or default_display_name(normalized),
         locale=payload.locale,
     )
     db.add(user)
@@ -111,24 +124,44 @@ async def register(
     db.add(
         EmailVerificationToken(
             user_id=user.id,
-            token_hash=token_digest(raw_token),
+            token_hash=token_digest(raw_token, settings.app_secret),
             expires_at=expires_in(hours=24),
         )
     )
-    db.add(AuditLog(user_id=user.id, event_type="user_registered", ip_address=client_ip(request)))
+    db.add(
+        UserConsent(
+            user_id=user.id,
+            document_type="terms",
+            document_version=payload.terms_version,
+            ip_address=client_ip(request),
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            event_type="user_registered",
+            ip_address=client_ip(request),
+            user_agent=request.headers.get("user-agent", "")[:512],
+            request_id=getattr(request.state, "request_id", None),
+        )
+    )
     await db.commit()
     background_tasks.add_task(send_verification_email, user.email, raw_token, settings)
     return MessageResponse(message="If the address can be registered, a verification email was sent")
 
 
 @router.post("/verify-email", response_model=MessageResponse)
-async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(get_db)) -> MessageResponse:
+async def verify_email(
+    payload: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> MessageResponse:
     token = await db.scalar(
         select(EmailVerificationToken).where(
-            EmailVerificationToken.token_hash == token_digest(payload.token),
+            EmailVerificationToken.token_hash == token_digest(payload.token, settings.app_secret),
             EmailVerificationToken.used_at.is_(None),
             EmailVerificationToken.expires_at > utc_now(),
-        )
+        ).with_for_update()
     )
     if not token:
         raise HTTPException(status_code=400, detail="Verification link is invalid or expired")
@@ -143,6 +176,43 @@ async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(g
     return MessageResponse(message="Email verified")
 
 
+@router.post("/resend-verification", response_model=MessageResponse)
+async def resend_verification(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> MessageResponse:
+    normalized = normalized_email(str(payload.email))
+    remote_ip = client_ip(request) or "unknown"
+    await rate_limiter.check(f"resend:email:{normalized}", 3, 3600)
+    await rate_limiter.check(f"resend:ip:{remote_ip}", 10, 3600)
+    await verify_turnstile(payload.turnstile_token, client_ip(request), settings)
+    user = await db.scalar(select(User).where(User.normalized_email == normalized))
+    if user and user.status == "pending_verification":
+        now = utc_now()
+        await db.execute(
+            update(EmailVerificationToken)
+            .where(
+                EmailVerificationToken.user_id == user.id,
+                EmailVerificationToken.used_at.is_(None),
+            )
+            .values(used_at=now)
+        )
+        raw_token = new_token()
+        db.add(
+            EmailVerificationToken(
+                user_id=user.id,
+                token_hash=token_digest(raw_token, settings.app_secret),
+                expires_at=expires_in(hours=24),
+            )
+        )
+        await db.commit()
+        background_tasks.add_task(send_verification_email, user.email, raw_token, settings)
+    return MessageResponse(message="If the account can be verified, an email was sent")
+
+
 @router.post("/login", response_model=AuthResponse)
 async def login(
     payload: LoginRequest,
@@ -151,10 +221,11 @@ async def login(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> AuthResponse:
+    normalized = normalized_email(str(payload.email))
+    remote_ip = client_ip(request) or "unknown"
+    await rate_limiter.check(f"login:{normalized}:{remote_ip}", 5, 600)
     await verify_turnstile(payload.turnstile_token, client_ip(request), settings)
-    user = await db.scalar(
-        select(User).where(User.normalized_email == normalized_email(str(payload.email)))
-    )
+    user = await db.scalar(select(User).where(User.normalized_email == normalized))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if user.status == "pending_verification":
@@ -162,13 +233,17 @@ async def login(
     if user.status != "active":
         raise HTTPException(status_code=403, detail="Account is not active")
     session_token, csrf_token = new_token(), new_token(32)
+    absolute_expires_at = expires_in(days=settings.session_absolute_days)
+    idle_expires_at = expires_in(hours=settings.session_idle_hours)
     auth_session = AuthSession(
         user_id=user.id,
-        token_hash=token_digest(session_token),
-        csrf_hash=token_digest(csrf_token),
+        token_hash=token_digest(session_token, settings.app_secret),
+        csrf_hash=token_digest(csrf_token, settings.app_secret),
         user_agent=request.headers.get("user-agent", "")[:512],
         ip_address=client_ip(request),
-        expires_at=expires_in(days=settings.session_absolute_days),
+        expires_at=absolute_expires_at,
+        idle_expires_at=idle_expires_at,
+        absolute_expires_at=absolute_expires_at,
     )
     db.add(auth_session)
     user.last_login_at = utc_now()
@@ -185,7 +260,7 @@ async def logout(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
-    await db.delete(auth.session)
+    auth.session.revoked_at = utc_now()
     await db.commit()
     response.delete_cookie(settings.session_cookie_name, path="/")
     response.delete_cookie(settings.csrf_cookie_name, path="/")
@@ -205,16 +280,27 @@ async def forgot_password(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
+    normalized = normalized_email(str(payload.email))
+    remote_ip = client_ip(request) or "unknown"
+    await rate_limiter.check(f"forgot:email:{normalized}", 3, 3600)
+    await rate_limiter.check(f"forgot:ip:{remote_ip}", 10, 3600)
     await verify_turnstile(payload.turnstile_token, client_ip(request), settings)
-    user = await db.scalar(
-        select(User).where(User.normalized_email == normalized_email(str(payload.email)))
-    )
+    user = await db.scalar(select(User).where(User.normalized_email == normalized))
     if user and user.status == "active":
+        now = utc_now()
+        await db.execute(
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.user_id == user.id,
+                PasswordResetToken.used_at.is_(None),
+            )
+            .values(used_at=now)
+        )
         raw_token = new_token()
         db.add(
             PasswordResetToken(
                 user_id=user.id,
-                token_hash=token_digest(raw_token),
+                token_hash=token_digest(raw_token, settings.app_secret),
                 expires_at=expires_in(minutes=30),
             )
         )
@@ -225,23 +311,39 @@ async def forgot_password(
 
 @router.post("/reset-password", response_model=MessageResponse)
 async def reset_password(
-    payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
     token = await db.scalar(
         select(PasswordResetToken).where(
-            PasswordResetToken.token_hash == token_digest(payload.token),
+            PasswordResetToken.token_hash == token_digest(payload.token, settings.app_secret),
             PasswordResetToken.used_at.is_(None),
             PasswordResetToken.expires_at > utc_now(),
-        )
+        ).with_for_update()
     )
     if not token:
         raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
     user = await db.get(User, token.user_id)
     if not user:
         raise HTTPException(status_code=400, detail="Reset link is invalid")
+    if verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=422, detail="New password must be different")
+    now = utc_now()
     user.password_hash = hash_password(payload.password)
-    token.used_at = utc_now()
-    await db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
+    await db.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+        )
+        .values(used_at=now)
+    )
+    await db.execute(
+        update(AuthSession)
+        .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
     db.add(AuditLog(user_id=user.id, event_type="password_reset"))
     await db.commit()
     return MessageResponse(message="Password reset completed")
@@ -250,20 +352,58 @@ async def reset_password(
 @router.post("/change-password", response_model=MessageResponse)
 async def change_password(
     payload: ChangePasswordRequest,
+    request: Request,
+    response: Response,
     auth: CurrentAuth = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
     if not verify_password(payload.current_password, auth.user.password_hash):
+        db.add(
+            AuditLog(
+                user_id=auth.user.id,
+                event_type="password_change_failed",
+                result="failure",
+                request_id=getattr(request.state, "request_id", None),
+            )
+        )
+        await db.commit()
         raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if verify_password(payload.new_password, auth.user.password_hash):
+        raise HTTPException(status_code=422, detail="New password must be different")
+    now = utc_now()
     auth.user.password_hash = hash_password(payload.new_password)
     await db.execute(
-        delete(AuthSession).where(
+        update(AuthSession)
+        .where(
             AuthSession.user_id == auth.user.id,
-            AuthSession.id != auth.session.id,
+            AuthSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    session_token, csrf_token = new_token(), new_token(32)
+    absolute_expires_at = expires_in(days=settings.session_absolute_days)
+    db.add(
+        AuthSession(
+            user_id=auth.user.id,
+            token_hash=token_digest(session_token, settings.app_secret),
+            csrf_hash=token_digest(csrf_token, settings.app_secret),
+            user_agent=request.headers.get("user-agent", "")[:512],
+            ip_address=client_ip(request),
+            expires_at=absolute_expires_at,
+            idle_expires_at=expires_in(hours=settings.session_idle_hours),
+            absolute_expires_at=absolute_expires_at,
         )
     )
-    db.add(AuditLog(user_id=auth.user.id, event_type="password_changed"))
+    db.add(
+        AuditLog(
+            user_id=auth.user.id,
+            event_type="password_changed",
+            request_id=getattr(request.state, "request_id", None),
+        )
+    )
     await db.commit()
+    set_auth_cookies(response, session_token, csrf_token, settings)
     return MessageResponse(message="Password changed")
 
 
@@ -274,7 +414,12 @@ async def list_sessions(
     sessions = (
         await db.scalars(
             select(AuthSession)
-            .where(AuthSession.user_id == auth.user.id, AuthSession.expires_at > utc_now())
+            .where(
+                AuthSession.user_id == auth.user.id,
+                AuthSession.absolute_expires_at > utc_now(),
+                AuthSession.idle_expires_at > utc_now(),
+                AuthSession.revoked_at.is_(None),
+            )
             .order_by(AuthSession.last_seen_at.desc())
         )
     ).all()
@@ -305,6 +450,6 @@ async def revoke_session(
     )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    await db.delete(session)
+    session.revoked_at = utc_now()
     await db.commit()
     return MessageResponse(message="Session revoked")

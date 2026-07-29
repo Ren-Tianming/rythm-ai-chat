@@ -12,10 +12,10 @@ export function LanguagePicker({ onChange }: { onChange?: (locale: Locale) => vo
   return (
     <label className="language-picker" aria-label="Language">
       <Languages size={16} />
-      <select value={i18n.resolvedLanguage?.slice(0, 2) || 'en'} onChange={(event) => change(event.target.value as Locale)}>
-        <option value="zh">中文</option>
-        <option value="ja">日本語</option>
-        <option value="en">English</option>
+      <select value={i18n.resolvedLanguage || 'en-US'} onChange={(event) => change(event.target.value as Locale)}>
+        <option value="zh-CN">中文</option>
+        <option value="ja-JP">日本語</option>
+        <option value="en-US">English</option>
       </select>
     </label>
   )

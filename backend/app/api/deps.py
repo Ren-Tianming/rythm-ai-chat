@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
@@ -29,24 +30,26 @@ async def get_current_auth(
     result = await db.execute(
         select(AuthSession, User)
         .join(User, User.id == AuthSession.user_id)
-        .where(AuthSession.token_hash == token_digest(raw_token))
+        .where(AuthSession.token_hash == token_digest(raw_token, settings.app_secret))
     )
     row = result.first()
     if not row:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
     auth_session, user = row
     now = utc_now()
-    idle_deadline = now - timedelta(hours=settings.session_idle_hours)
     if (
-        auth_session.expires_at <= now
-        or auth_session.last_seen_at <= idle_deadline
+        auth_session.absolute_expires_at <= now
+        or auth_session.idle_expires_at <= now
+        or auth_session.revoked_at is not None
         or user.status != "active"
     ):
-        await db.delete(auth_session)
+        auth_session.revoked_at = now
         await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
-    auth_session.last_seen_at = now
-    await db.commit()
+    if auth_session.last_seen_at <= now - timedelta(minutes=5):
+        auth_session.last_seen_at = now
+        auth_session.idle_expires_at = now + timedelta(hours=settings.session_idle_hours)
+        await db.commit()
     return CurrentAuth(user=user, session=auth_session)
 
 
@@ -62,9 +65,28 @@ async def require_csrf(
         not csrf_header
         or not cookie_value
         or not secrets_equal(csrf_header, cookie_value)
-        or token_digest(csrf_header) != auth.session.csrf_hash
+        or token_digest(csrf_header, settings.app_secret) != auth.session.csrf_hash
     ):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "CSRF_INVALID", "message": "Invalid CSRF token"},
+        )
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    source = origin or referer
+    if source:
+        parsed = urlparse(source)
+        source_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        if source_origin not in settings.allowed_csrf_origins:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "CSRF_INVALID", "message": "Request origin is not allowed"},
+            )
+    elif settings.is_production:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "CSRF_INVALID", "message": "Request origin is required"},
+        )
     return auth
 
 

@@ -26,7 +26,7 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
     let message = response.statusText
     try {
       const data = await response.json()
-      message = data.detail || data.message || message
+      message = data.error?.message || data.detail || data.message || message
     } catch {
       // Keep HTTP status text.
     }
@@ -37,24 +37,39 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
 }
 
 export const api = {
-  me: () => request<User>('/auth/me'),
+  me: () => request<User>('/users/me'),
   login: (email: string, password: string, turnstileToken?: string) =>
     request<{ user: User; csrf_token: string }>('/auth/login', {
       method: 'POST', body: JSON.stringify({ email, password, turnstile_token: turnstileToken || null }),
     }),
-  register: (data: { email: string; password: string; display_name?: string; locale: string; turnstile_token?: string }) =>
+  register: (data: {
+    email: string
+    password: string
+    password_confirm: string
+    display_name?: string
+    locale: string
+    terms_version: string
+    terms_accepted: boolean
+    turnstile_token?: string
+  }) =>
     request<{ message: string }>('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
+  resendVerification: (email: string, turnstileToken?: string) =>
+    request<{ message: string }>('/auth/resend-verification', {
+      method: 'POST', body: JSON.stringify({ email, turnstile_token: turnstileToken || null }),
+    }),
   forgot: (email: string, turnstileToken?: string) =>
     request<{ message: string }>('/auth/forgot-password', {
       method: 'POST', body: JSON.stringify({ email, turnstile_token: turnstileToken || null }),
     }),
-  reset: (token: string, password: string) =>
-    request<{ message: string }>('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, password }) }),
+  reset: (token: string, password: string, passwordConfirm: string) =>
+    request<{ message: string }>('/auth/reset-password', {
+      method: 'POST', body: JSON.stringify({ token, password, password_confirm: passwordConfirm }),
+    }),
   verify: (token: string) =>
     request<{ message: string }>('/auth/verify-email', { method: 'POST', body: JSON.stringify({ token }) }),
   logout: () => request<{ message: string }>('/auth/logout', { method: 'POST' }),
   models: () => request<ModelProfile[]>('/model-profiles'),
-  conversations: () => request<Conversation[]>('/conversations'),
+  conversations: (archived = false) => request<Conversation[]>(`/conversations?archived=${archived}`),
   createConversation: (model_profile_id: string) =>
     request<Conversation>('/conversations', { method: 'POST', body: JSON.stringify({ model_profile_id }) }),
   updateConversation: (id: string, data: Partial<Pick<Conversation, 'title' | 'model_profile_id' | 'archived'>>) =>
@@ -64,6 +79,17 @@ export const api = {
   usage: () => request<UsageSummary>('/usage/me'),
   sessions: () => request<UserSession[]>('/auth/sessions'),
   revokeSession: (id: string) => request(`/auth/sessions/${id}`, { method: 'DELETE' }),
+  changePassword: (currentPassword: string, newPassword: string, newPasswordConfirm: string) =>
+    request<{ message: string }>('/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+        new_password_confirm: newPasswordConfirm,
+      }),
+    }),
+  cancelGeneration: (id: string) =>
+    request<{ message: string }>(`/generations/${id}/cancel`, { method: 'POST' }),
   updateMe: (data: { display_name?: string | null; locale?: string }) =>
     request<User>('/users/me', { method: 'PATCH', body: JSON.stringify(data) }),
 }
@@ -72,12 +98,15 @@ export interface StreamHandlers {
   onMetadata?: (data: Record<string, unknown>) => void
   onDelta: (text: string) => void
   onDone?: (data: Record<string, unknown>) => void
+  onUsage?: (data: Record<string, unknown>) => void
   onError?: (message: string) => void
 }
 
 export async function streamChat(
   conversationId: string,
   content: string,
+  clientRequestId: string,
+  modelProfileId: string | null,
   signal: AbortSignal,
   handlers: StreamHandlers,
 ): Promise<void> {
@@ -85,12 +114,19 @@ export async function streamChat(
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': cookie('rythm_csrf') },
     credentials: 'include',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      client_request_id: clientRequestId,
+      model_profile_id: modelProfileId,
+    }),
     signal,
   })
   if (!response.ok || !response.body) {
     let message = response.statusText
-    try { message = (await response.json()).detail || message } catch { /* noop */ }
+    try {
+      const data = await response.json()
+      message = data.error?.message || data.detail || message
+    } catch { /* noop */ }
     throw new ApiError(response.status, message)
   }
   const reader = response.body.getReader()
@@ -111,7 +147,8 @@ export async function streamChat(
       }
       const parsed = JSON.parse(data) as Record<string, unknown>
       if (event === 'delta') handlers.onDelta(String(parsed.text || ''))
-      else if (event === 'metadata') handlers.onMetadata?.(parsed)
+      else if (event === 'metadata' || event === 'meta') handlers.onMetadata?.(parsed)
+      else if (event === 'usage') handlers.onUsage?.(parsed)
       else if (event === 'done') handlers.onDone?.(parsed)
       else if (event === 'error') handlers.onError?.(String(parsed.message || 'Generation failed'))
     }
