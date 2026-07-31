@@ -1,6 +1,7 @@
 # RyThM Chatbot / 天铭聊天机器人
-
-![RyThM Chatbot](frontend/public/rythm-logo.png)
+<p align="center">
+  <img src="frontend/public/rythm-logo.png" alt="RyThM Music logo" width="180">
+</p>
 
 RyThM Chatbot is a multilingual, multi-provider AI chat MVP built for low-cost deployment without giving up the engineering foundations needed for a real service.
 
