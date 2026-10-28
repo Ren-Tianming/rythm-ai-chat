@@ -25,7 +25,11 @@ class GeminiProvider(BaseLLMProvider):
         contents = [
             {
                 "role": "model" if message.role == "assistant" else "user",
-                "parts": [{"text": message.content}],
+                "parts": [{"text": message.content}]
+                + [
+                    {"inlineData": {"mimeType": image["mime_type"], "data": image["data"]}}
+                    for image in message.images
+                ],
             }
             for message in messages
             if message.role != "system"
@@ -39,49 +43,47 @@ class GeminiProvider(BaseLLMProvider):
         url = f"{self.base_url}/models/{model_id}:streamGenerateContent"
         try:
             async with self.client.stream(
-                    "POST", url, params={"alt": "sse", "key": self.api_key}, json=payload
-                ) as response:
-                    if response.status_code >= 400:
-                        await response.aread()
-                        if response.status_code == 429:
-                            raise ProviderError(
-                                "MODEL_RATE_LIMITED",
-                                "The model is temporarily rate limited",
-                                retryable=True,
-                            )
-                        if response.status_code in {401, 403}:
-                            raise ProviderError(
-                                "MODEL_AUTH_FAILED", "The model is temporarily unavailable"
-                            )
-                        if response.status_code == 404:
-                            raise ProviderError(
-                                "MODEL_NOT_FOUND", "The selected model is unavailable"
-                            )
+                "POST", url, params={"alt": "sse", "key": self.api_key}, json=payload
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    if response.status_code == 429:
                         raise ProviderError(
-                            "MODEL_UPSTREAM_ERROR",
-                            "The model service returned an error",
-                            retryable=response.status_code >= 500,
+                            "MODEL_RATE_LIMITED",
+                            "The model is temporarily rate limited",
+                            retryable=True,
                         )
-                    request_id = response.headers.get("x-request-id")
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        try:
-                            item = json.loads(line[5:].strip())
-                        except json.JSONDecodeError:
-                            continue
-                        candidates = item.get("candidates") or []
-                        candidate = candidates[0] if candidates else {}
-                        parts = (candidate.get("content") or {}).get("parts") or []
-                        text = "".join(part.get("text", "") for part in parts)
-                        usage = item.get("usageMetadata") or {}
-                        yield ProviderEvent(
-                            text=text,
-                            input_tokens=usage.get("promptTokenCount"),
-                            output_tokens=usage.get("candidatesTokenCount"),
-                            finish_reason=candidate.get("finishReason"),
-                            request_id=request_id,
+                    if response.status_code in {401, 403}:
+                        raise ProviderError(
+                            "MODEL_AUTH_FAILED", "The model is temporarily unavailable"
                         )
+                    if response.status_code == 404:
+                        raise ProviderError("MODEL_NOT_FOUND", "The selected model is unavailable")
+                    raise ProviderError(
+                        "MODEL_UPSTREAM_ERROR",
+                        "The model service returned an error",
+                        retryable=response.status_code >= 500,
+                    )
+                request_id = response.headers.get("x-request-id")
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        item = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    candidates = item.get("candidates") or []
+                    candidate = candidates[0] if candidates else {}
+                    parts = (candidate.get("content") or {}).get("parts") or []
+                    text = "".join(part.get("text", "") for part in parts)
+                    usage = item.get("usageMetadata") or {}
+                    yield ProviderEvent(
+                        text=text,
+                        input_tokens=usage.get("promptTokenCount"),
+                        output_tokens=usage.get("candidatesTokenCount"),
+                        finish_reason=candidate.get("finishReason"),
+                        request_id=request_id,
+                    )
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "MODEL_TIMEOUT", "The model response timed out", 504, retryable=True

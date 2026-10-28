@@ -16,3 +16,5 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 *.log
 backups/
+frontend/test-results/
+frontend/playwright-report/

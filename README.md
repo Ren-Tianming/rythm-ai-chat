@@ -101,10 +101,10 @@ The Vite development server proxies `/api` to `http://localhost:8000`.
 | `GROQ_API_KEY` | Groq server-side API key |
 | `GROQ_MODEL` | Explicit Groq provider model ID |
 | `CONTEXT_ROUNDS` | Complete history rounds sent to the provider; default `5` |
-| `MAX_OUTPUT_TOKENS` | Global output ceiling; default `512` |
+| `MAX_OUTPUT_TOKENS` | Optional global cost cap; unset by default (model-level budget) |
 | `DAILY_CHAT_LIMIT` | Accepted generation attempts per verified user per UTC day |
 | `MAX_CONCURRENT_GENERATIONS_PER_USER` | Concurrent generation ceiling per user; default `1` |
-| `GENERATION_TIMEOUT_SECONDS` | Absolute generation timeout and stale-lock safeguard; default `120` |
+| `GENERATION_TIMEOUT_SECONDS` | Absolute generation timeout and stale-lock safeguard; default `600` |
 | `COOKIE_SECURE` | Must be `true` behind production HTTPS |
 | `TURNSTILE_REQUIRED` | Require Cloudflare Turnstile server verification |
 | `VITE_TURNSTILE_SITE_KEY` | Public Turnstile site key compiled into the frontend |
@@ -154,3 +154,23 @@ docker compose config
 ## License
 
 No license has been granted yet. Add an explicit license before accepting external contributions or commercial redistribution.
+
+## Documents, RAG and long answers
+
+Upload PDF (text/scanned), TXT, Markdown, PNG, JPEG or WebP from the chat composer, or drag files onto it. Select which current-conversation files to use; queued/processing/failed files show their status and can be deselected to continue ordinary chat. Ready documents can be previewed, reprocessed or deleted. Source panels show actual retrieved passages and PDF pages. Images use local OCR; Vision-capable profiles also receive selected images.
+
+Output budgets now follow model/service/context settings instead of the previous fixed 512/1024 ceilings. A length-limited or stopped partial response can be continued. The input box remains limited to 4000 characters; uploaded text is supplied through retrieval rather than that input limit.
+
+Configure the embedding service and private worker before using documents. See [deployment and backup instructions](deploy/README.md#rag--document-release-0004). DOCX/CSV/XLSX, permanent cross-conversation knowledge bases, hybrid search and rerankers remain P1.
+
+Run all backend integration tests with a disposable PostgreSQL + pgvector database:
+
+```sh
+cd backend
+export DATABASE_URL=postgresql+asyncpg://rythm:password@localhost/rythm_test
+export TEST_DATABASE_URL="$DATABASE_URL"
+alembic upgrade head
+pytest
+```
+
+Tests create isolated schemas and use deterministic test-only AI/embedding responses; OCR and pgvector queries run for real. No external provider credentials are needed for CI. Real-provider answer quality, cross-language recall, pricing and Vision capability must also be checked with the actual deployment models.

@@ -14,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.services.llm import ProviderRegistry
+from app.services.upload_limit import UploadBodyLimit
 
 
 settings = get_settings()
@@ -27,7 +28,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("request_id", "route", "status", "latency_ms", "user_id"):
+        for key in ("request_id", "route", "status", "latency_ms", "user_id", "error_type"):
             value = getattr(record, key, None)
             if value is not None:
                 payload[key] = value
@@ -38,6 +39,7 @@ handler = logging.StreamHandler()
 handler.setFormatter(JsonFormatter())
 logging.basicConfig(level=getattr(logging, settings.log_level), handlers=[handler], force=True)
 logger = logging.getLogger("rythm.api")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def error_content(request: Request, code: str, message: str, details: object = None) -> dict:
@@ -65,6 +67,7 @@ def create_app() -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
+    app.add_middleware(UploadBodyLimit, settings=settings)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
     app.add_middleware(
         CORSMiddleware,
@@ -81,6 +84,8 @@ def create_app() -> FastAPI:
         started = time.perf_counter()
         response = await call_next(request)
         latency_ms = round((time.perf_counter() - started) * 1000)
+        if "/documents" in request.url.path or "/messages" in request.url.path:
+            response.headers["Cache-Control"] = "private, no-store"
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -131,7 +136,9 @@ def create_app() -> FastAPI:
         ]
         return JSONResponse(
             status_code=422,
-            content=error_content(request, "VALIDATION_ERROR", "Request validation failed", details),
+            content=error_content(
+                request, "VALIDATION_ERROR", "Request validation failed", details
+            ),
         )
 
     @app.exception_handler(ValueError)
@@ -143,13 +150,13 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, exc: Exception):
-        logger.exception(
+        logger.error(
             "unhandled_request_error",
-            exc_info=exc,
             extra={
                 "request_id": getattr(request.state, "request_id", None),
                 "route": request.url.path,
                 "status": 500,
+                "error_type": type(exc).__name__,
             },
         )
         return JSONResponse(

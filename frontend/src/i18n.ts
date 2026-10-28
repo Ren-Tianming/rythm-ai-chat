@@ -1,8 +1,10 @@
 import i18n from 'i18next'
+import { documentTranslations } from './document-i18n'
 import { initReactI18next } from 'react-i18next'
 
 export const resources = {
   'zh-CN': { translation: {
+    ...documentTranslations['zh-CN'],
     brandSubtitle: '天铭聊天机器人', login: '登录', register: '注册', forgot: '找回密码', reset: '重置密码',
     email: '邮箱', password: '密码', displayName: '显示名称', send: '发送', stop: '停止',
     verifyHint: '注册后请打开验证邮件完成激活。', passwordHint: '至少12个字符',
@@ -27,6 +29,7 @@ export const resources = {
     models: { deepseek: '高性价比综合模型', gemini: '多语言轻量模型', groq: '极速开源模型推理' },
   }},
   'ja-JP': { translation: {
+    ...documentTranslations['ja-JP'],
     brandSubtitle: '天銘チャットボット', login: 'ログイン', register: '登録', forgot: 'パスワード再設定', reset: 'パスワードを変更',
     email: 'メールアドレス', password: 'パスワード', displayName: '表示名', send: '送信', stop: '停止',
     verifyHint: '登録後、確認メールからアカウントを有効化してください。', passwordHint: '12文字以上',
@@ -51,6 +54,7 @@ export const resources = {
     models: { deepseek: 'コスト性能に優れた汎用モデル', gemini: '多言語対応の軽量モデル', groq: '高速なオープンモデル推論' },
   }},
   'en-US': { translation: {
+    ...documentTranslations['en-US'],
     brandSubtitle: 'Tianming Chatbot', login: 'Sign in', register: 'Create account', forgot: 'Forgot password', reset: 'Reset password',
     email: 'Email', password: 'Password', displayName: 'Display name', send: 'Send', stop: 'Stop',
     verifyHint: 'Open the verification email after registration to activate your account.', passwordHint: 'At least 12 characters',

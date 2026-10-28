@@ -10,7 +10,9 @@ from app.schemas.chat import ModelProfileResponse
 from app.services.llm import configured_provider_names
 
 
-router = APIRouter(prefix="/model-profiles", tags=["models"], dependencies=[Depends(get_current_auth)])
+router = APIRouter(
+    prefix="/model-profiles", tags=["models"], dependencies=[Depends(get_current_auth)]
+)
 
 
 @router.get("", response_model=list[ModelProfileResponse])
@@ -39,6 +41,7 @@ async def list_models(
             description_key=item.description_key,
             is_default=item.is_default,
             max_output_tokens=item.max_output_tokens,
+            supports_vision=bool((item.config_json or {}).get("supports_vision", False)),
         )
         for item in models
     ]

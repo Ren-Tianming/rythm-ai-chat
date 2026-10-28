@@ -1,4 +1,4 @@
-import type { ChatMessage, Conversation, ModelProfile, UsageSummary, User, UserSession } from '../types'
+import type { ChatMessage, Conversation, DocumentInfo, ModelProfile, UsageSummary, User, UserSession } from '../types'
 
 const API = '/api/v1'
 
@@ -16,7 +16,7 @@ export class ApiError extends Error {
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method || 'GET').toUpperCase()
   const headers = new Headers(init.headers)
-  if (init.body) headers.set('Content-Type', 'application/json')
+  if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
     const csrf = cookie('rythm_csrf')
     if (csrf) headers.set('X-CSRF-Token', csrf)
@@ -37,6 +37,15 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
 }
 
 export const api = {
+  documentLimits: () => request<{ max_bytes: number; batch_limit: number; pdf_pages: number }>('/documents/limits'),
+  documents: (id: string) => request<DocumentInfo[]>(`/conversations/${id}/documents`),
+  document: (id: string) => request<DocumentInfo>(`/documents/${id}`),
+  uploadDocuments: (id: string, files: File[]) => {
+    const body = new FormData(); files.forEach(file => body.append('files', file))
+    return request<DocumentInfo[]>(`/conversations/${id}/documents`, { method: 'POST', body })
+  },
+  deleteDocument: (id: string) => request<void>(`/documents/${id}`, { method: 'DELETE' }),
+  retryDocument: (id: string) => request<DocumentInfo>(`/documents/${id}/retry`, { method: 'POST' }),
   me: () => request<User>('/users/me'),
   login: (email: string, password: string, turnstileToken?: string) =>
     request<{ user: User; csrf_token: string }>('/auth/login', {
@@ -109,6 +118,8 @@ export async function streamChat(
   modelProfileId: string | null,
   signal: AbortSignal,
   handlers: StreamHandlers,
+  documentIds: string[] = [],
+  continueMessageId?: string,
 ): Promise<void> {
   const response = await fetch(`${API}/conversations/${conversationId}/messages/stream`, {
     method: 'POST',
@@ -116,6 +127,8 @@ export async function streamChat(
     credentials: 'include',
     body: JSON.stringify({
       content,
+      document_ids: documentIds,
+      continue_message_id: continueMessageId || null,
       client_request_id: clientRequestId,
       model_profile_id: modelProfileId,
     }),

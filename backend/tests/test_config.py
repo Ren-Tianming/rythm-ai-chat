@@ -20,9 +20,9 @@ def test_generation_concurrency_defaults_are_cost_safe() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.max_concurrent_generations_per_user == 1
-    assert settings.generation_timeout_seconds == 120
+    assert settings.generation_timeout_seconds == 600
     assert settings.context_rounds == 5
-    assert settings.max_output_tokens <= 1024
+    assert settings.max_output_tokens is None
 
 
 def test_production_rejects_fail_open_configuration() -> None:

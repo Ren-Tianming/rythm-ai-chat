@@ -31,6 +31,11 @@ from app.schemas.chat import (
     UsageSummaryResponse,
 )
 from app.schemas.auth import MessageResponse
+from app.services.rag import RAG_INSTRUCTIONS, retrieve, persist_sources, message_source_map
+from app.services.token_budget import output_budget, count_tokens
+from app.services.llm.base import ProviderEvent
+from app.api.routes.documents import remove_document
+from app.db.models import Document
 from app.services.context import ContextMessage, select_complete_rounds
 from app.services.anti_abuse import rate_limiter
 from app.services.generation_control import generation_controls
@@ -51,12 +56,17 @@ class GenerationCancelled(Exception):
     pass
 
 
-async def events_with_keepalive(provider, messages, model_id, max_tokens):
+async def events_with_keepalive(provider, messages, model_id, max_tokens, control):
     iterator = provider.stream(messages, model_id, max_tokens).__aiter__()
     pending = asyncio.create_task(anext(iterator))
+    cancelled = asyncio.create_task(control.cancelled.wait())
     try:
         while True:
-            done, _ = await asyncio.wait({pending}, timeout=15)
+            done, _ = await asyncio.wait(
+                {pending, cancelled}, timeout=5, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancelled in done:
+                raise GenerationCancelled
             if not done:
                 yield None
                 continue
@@ -67,8 +77,9 @@ async def events_with_keepalive(provider, messages, model_id, max_tokens):
             yield event
             pending = asyncio.create_task(anext(iterator))
     finally:
-        if not pending.done():
-            pending.cancel()
+        cancelled.cancel()
+        pending.cancel()
+        await asyncio.gather(pending, cancelled, return_exceptions=True)
         close = getattr(iterator, "aclose", None)
         if close:
             await close()
@@ -186,16 +197,23 @@ async def delete_conversation(
     conversation_id: uuid.UUID,
     auth: CurrentAuth = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> MessageResponse:
+    await db.scalar(select(User.id).where(User.id == auth.user.id).with_for_update())
     item = await get_owned_conversation(conversation_id, auth.user.id, db)
+    documents = (
+        await db.scalars(
+            select(Document).where(Document.conversation_id == item.id).with_for_update()
+        )
+    ).all()
+    for document in documents:
+        await remove_document(document, db, settings)
     item.deleted_at = utc_now()
     await db.commit()
     return MessageResponse(message="Conversation deleted")
 
 
-@router.get(
-    "/conversations/{conversation_id}/messages", response_model=list[ChatMessageResponse]
-)
+@router.get("/conversations/{conversation_id}/messages", response_model=list[ChatMessageResponse])
 async def list_messages(
     conversation_id: uuid.UUID,
     before_sequence: int | None = None,
@@ -210,6 +228,7 @@ async def list_messages(
     items = (
         await db.scalars(query.order_by(Message.sequence_no.desc()).limit(min(limit, 100)))
     ).all()
+    source_map = await message_source_map(db, [item.id for item in items])
     return [
         ChatMessageResponse(
             id=item.id,
@@ -221,6 +240,8 @@ async def list_messages(
             input_tokens=item.input_tokens,
             output_tokens=item.output_tokens,
             created_at=item.created_at,
+            finish_reason=item.finish_reason,
+            sources=source_map.get(item.id, []),
         )
         for item in reversed(items)
     ]
@@ -244,9 +265,7 @@ async def stream_message(
         raise HTTPException(status_code=422, detail="Message cannot be empty")
     if len(content) > settings.max_input_chars:
         raise HTTPException(status_code=422, detail="Message is too long")
-    await rate_limiter.check(
-        f"chat:user:{auth.user.id}", settings.chat_per_minute_limit, 60
-    )
+    await rate_limiter.check(f"chat:user:{auth.user.id}", settings.chat_per_minute_limit, 60)
     conversation = await get_owned_conversation(conversation_id, auth.user.id, db)
     selected_model_id = payload.model_profile_id or conversation.model_profile_id
     model = await db.scalar(
@@ -331,6 +350,121 @@ async def stream_message(
             detail="This conversation already has a generation in progress",
         )
 
+    continuation = None
+    retrieval_question = content
+    if payload.continue_message_id:
+        continuation = await db.scalar(
+            select(Message).where(
+                Message.id == payload.continue_message_id,
+                Message.conversation_id == conversation.id,
+                Message.role == "assistant",
+                Message.content != "",
+            )
+        )
+        latest = await db.scalar(
+            select(func.max(Message.sequence_no)).where(Message.conversation_id == conversation.id)
+        )
+        if not continuation or continuation.sequence_no != latest:
+            raise HTTPException(409, "Only the latest nonempty assistant response can be continued")
+        root = continuation
+        for _ in range(100):
+            if not root.continuation_of_id:
+                break
+            parent = await db.get(Message, root.continuation_of_id)
+            if not parent or parent.conversation_id != conversation.id:
+                break
+            root = parent
+        original_question = await db.scalar(
+            select(Message.content).where(
+                Message.conversation_id == conversation.id,
+                Message.sequence_no == root.sequence_no - 1,
+                Message.role == "user",
+            )
+        )
+        retrieval_question = original_question or content
+    context_window = int((model.config_json or {}).get("context_window_tokens", 32768))
+    rag_bytes = (
+        min(settings.max_context_chars, context_window - model.default_output_tokens)
+        - len((settings.system_prompt + RAG_INSTRUCTIONS + content).encode())
+        - 4096
+    )
+    sources, rag_context, images, document_warnings = await retrieve(
+        db,
+        auth.user.id,
+        conversation.id,
+        payload.document_ids,
+        retrieval_question,
+        settings,
+        model,
+        budget_bytes=max(0, rag_bytes),
+    )
+    system_prompt = settings.system_prompt + (
+        "\n" + RAG_INSTRUCTIONS if payload.document_ids else ""
+    )
+    llm_messages = [LLMMessage(role="system", content=system_prompt)]
+    # Mark file context as user-supplied data. It never gets system-level authority.
+    request_content = content
+    if payload.document_ids:
+        request_content += "\n\nUntrusted retrieved evidence (JSON records):\n" + (
+            rag_context or "No relevant evidence found."
+        )
+    if continuation:
+        # Preserve the interruption point while keeping a bounded history tail.
+        tail = continuation.content.encode("utf-8")[-8000:].decode("utf-8", errors="ignore")
+        request_content += (
+            "\n\nOriginal question: "
+            + retrieval_question
+            + "\nContinue directly after this assistant text without repeating it. Prior source labels must be rechecked against current evidence:\n"
+            + tail
+        )
+    llm_messages.append(LLMMessage(role="user", content=request_content, images=images))
+    try:
+        max_tokens = output_budget(model, settings, llm_messages)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+    previous_rows = (
+        await db.scalars(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation.id,
+                Message.status == "completed",
+            )
+            .order_by(Message.sequence_no.asc())
+        )
+    ).all()
+    candidate_history = select_complete_rounds(
+        [ContextMessage(role=item.role, content=item.content) for item in previous_rows],
+        min(settings.context_rounds, model.context_rounds, 5),
+    )
+    budget = max(
+        0,
+        min(
+            settings.max_context_chars,
+            context_window
+            - max_tokens
+            - int((model.config_json or {}).get("vision_tokens_per_image", 4096)) * len(images)
+            - 512,
+        )
+        - len(system_prompt.encode())
+        - len(request_content.encode()),
+    )
+    history: list[ContextMessage] = []
+    used_chars = 0
+    for index in range(len(candidate_history) - 2, -1, -2):
+        pair = candidate_history[index : index + 2]
+        pair_chars = sum(len(item.content.encode()) + 16 for item in pair)
+        if used_chars + pair_chars > budget:
+            break
+        history[0:0] = pair
+        used_chars += pair_chars
+    context_truncated = len(history) < len(candidate_history)
+
+    llm_messages[1:1] = [LLMMessage(role=item.role, content=item.content) for item in history]
+    try:
+        max_tokens = output_budget(model, settings, llm_messages)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     max_sequence = await db.scalar(
         select(func.max(Message.sequence_no)).where(Message.conversation_id == conversation.id)
     )
@@ -349,6 +483,7 @@ async def stream_message(
         role="assistant",
         content="",
         status="streaming",
+        continuation_of_id=continuation.id if continuation else None,
         model_profile_id=model.id,
     )
     db.add(assistant_message)
@@ -360,48 +495,18 @@ async def stream_message(
         user_message_id=user_message.id,
         assistant_message_id=assistant_message.id,
         model_profile_id=model.id,
+        context_truncated=context_truncated,
     )
     db.add(generation)
+    persist_sources(db, assistant_message.id, sources)
     if (max_sequence or 0) == 0:
         conversation.title = content[:30] + ("…" if len(content) > 30 else "")
     conversation.updated_at = utc_now()
     await db.commit()
 
-    previous_rows = (
-        await db.scalars(
-            select(Message)
-            .where(
-                Message.conversation_id == conversation.id,
-                Message.sequence_no < user_message.sequence_no,
-                Message.status == "completed",
-            )
-            .order_by(Message.sequence_no.asc())
-        )
-    ).all()
-    candidate_history = select_complete_rounds(
-        [ContextMessage(role=item.role, content=item.content) for item in previous_rows],
-        min(settings.context_rounds, model.context_rounds, 5),
-    )
-    budget = max(0, settings.max_context_chars - len(settings.system_prompt) - len(content))
-    history: list[ContextMessage] = []
-    used_chars = 0
-    for index in range(len(candidate_history) - 2, -1, -2):
-        pair = candidate_history[index : index + 2]
-        pair_chars = sum(len(item.content) for item in pair)
-        if used_chars + pair_chars > budget:
-            break
-        history[0:0] = pair
-        used_chars += pair_chars
-    generation.context_truncated = len(history) < len(candidate_history)
-    await db.commit()
-
-    llm_messages = [LLMMessage(role="system", content=settings.system_prompt)]
-    llm_messages.extend(LLMMessage(role=item.role, content=item.content) for item in history)
-    llm_messages.append(LLMMessage(role="user", content=content))
     registry = request.app.state.provider_registry
     provider = registry.get(model.provider)
     actual_model_id = configured_model_id(model.provider, model.model_id, settings)
-    max_tokens = min(model.max_output_tokens, settings.max_output_tokens, 1024)
     control = generation_controls.register(generation.id)
 
     async def event_stream() -> AsyncIterator[str]:
@@ -422,6 +527,9 @@ async def stream_message(
                     "model_key": model.slug,
                     "history_rounds": len(history) // 2,
                     "context_truncated": generation.context_truncated,
+                    "max_output_tokens": max_tokens,
+                    "sources": sources,
+                    "document_warnings": document_warnings,
                 },
             )
             async with asyncio.timeout(settings.generation_timeout_seconds):
@@ -429,9 +537,26 @@ async def stream_message(
                 emitted_delta = False
                 while True:
                     try:
-                        async for event in events_with_keepalive(
-                            provider, llm_messages, actual_model_id, max_tokens
-                        ):
+
+                        async def response_events():
+                            if payload.document_ids and not sources:
+                                text = {
+                                    "ja-JP": "選択した文書から関連する十分な証拠が見つかりません。文書に基づく回答はできません。",
+                                    "zh-CN": "所选文档中没有找到足够的相关证据，无法根据这些文档作答。",
+                                }.get(
+                                    auth.user.locale,
+                                    "The selected documents do not contain sufficient relevant evidence to answer this question.",
+                                )
+                                yield ProviderEvent(
+                                    text=text, finish_reason="insufficient_evidence"
+                                )
+                            else:
+                                async for event in events_with_keepalive(
+                                    provider, llm_messages, actual_model_id, max_tokens, control
+                                ):
+                                    yield event
+
+                        async for event in response_events():
                             if control.cancelled.is_set() or await request.is_disconnected():
                                 raise GenerationCancelled
                             if event is None:
@@ -456,6 +581,16 @@ async def stream_message(
                             await asyncio.sleep(0.5)
                             continue
                         raise
+            input_tokens = input_tokens or (
+                sum(count_tokens(m.content) for m in llm_messages)
+                if finish_reason != "insufficient_evidence"
+                else 0
+            )
+            output_tokens = (
+                (output_tokens or count_tokens(full_text))
+                if finish_reason != "insufficient_evidence"
+                else 0
+            )
             assistant_message.content = full_text
             assistant_message.status = "completed"
             assistant_message.input_tokens = input_tokens
@@ -507,6 +642,9 @@ async def stream_message(
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "finish_reason": finish_reason,
+                    "truncated": finish_reason in ("length", "MAX_TOKENS", "max_tokens"),
+                    "can_continue": bool(full_text)
+                    and finish_reason in ("length", "MAX_TOKENS", "max_tokens"),
                 },
             )
         except (GenerationCancelled, asyncio.CancelledError) as exc:
@@ -561,6 +699,43 @@ async def stream_message(
             yield sse("error", {"code": "INTERNAL_ERROR", "message": "Generation failed"})
         finally:
             generation_controls.remove(generation.id)
+            # Persist usage for stopped/failed requests as well as successful generations.
+            # When providers omit final usage on cancellation, record a conservative text estimate.
+            if full_text and not await db.scalar(
+                select(UsageEvent.id).where(UsageEvent.generation_id == generation.id)
+            ):
+                input_tokens = input_tokens or sum(count_tokens(m.content) for m in llm_messages)
+                output_tokens = output_tokens or count_tokens(full_text)
+                assistant_message.input_tokens, assistant_message.output_tokens = (
+                    input_tokens,
+                    output_tokens,
+                )
+                cost = estimate_cost_microusd(
+                    model.provider,
+                    actual_model_id,
+                    input_tokens,
+                    output_tokens,
+                    float(model.input_price_per_million)
+                    if model.input_price_per_million is not None
+                    else None,
+                    float(model.output_price_per_million)
+                    if model.output_price_per_million is not None
+                    else None,
+                )
+                db.add(
+                    UsageEvent(
+                        user_id=auth.user.id,
+                        generation_id=generation.id,
+                        provider=model.provider,
+                        model_id=actual_model_id,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        total_tokens=input_tokens + output_tokens,
+                        estimated_cost_microusd=cost,
+                        pricing_version=model.pricing_version,
+                    )
+                )
+                await db.commit()
 
     return StreamingResponse(
         event_stream(),

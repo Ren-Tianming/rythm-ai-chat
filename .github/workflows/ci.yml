@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-alpine
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_DB: rythm_test
           POSTGRES_USER: rythm
@@ -26,6 +26,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      TEST_DATABASE_URL: postgresql+asyncpg://rythm:test-password@127.0.0.1:5432/rythm_test
+      OCR_LANGUAGES: eng
       DATABASE_URL: postgresql+asyncpg://rythm:test-password@127.0.0.1:5432/rythm_test
     defaults:
       run:
@@ -37,10 +39,29 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/pyproject.toml
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn tesseract-ocr-chi-sim
       - run: pip install -e '.[dev]'
+      - run: python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
       - run: ruff check .
       - run: alembic upgrade head
       - run: pytest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install chromium --with-deps
+        working-directory: frontend
+      - run: ../scripts/test-browser.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-results
+          retention-days: 7
+          path: frontend/test-results/
+
 
   frontend:
     runs-on: ubuntu-latest
@@ -58,3 +79,9 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm audit --omit=dev --audit-level=high
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/test-docker.sh
