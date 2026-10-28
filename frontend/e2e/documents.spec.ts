@@ -48,7 +48,7 @@ test('register, login, RAG documents, long output, continue, stop and history', 
   await expect(page.locator('.attachment--ready')).toHaveCount(5)
   await expect(page.getByText('This model supports OCR text only; visual image understanding is unavailable.')).toBeVisible()
   await page.getByRole('button', { name: 'Preview: plan.png', exact: true }).click()
-  await expect(page.getByRole('dialog').getByRole('img')).toBeVisible()
+  await expect(page.getByRole('dialog').getByRole('img', { name: 'plan.png', exact: true })).toBeVisible()
   await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click()
   await page.locator('.model-select select').selectOption({ label: 'Test Vision' })
   await send('What is the ORION budget in these files?')
