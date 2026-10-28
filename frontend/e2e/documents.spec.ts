@@ -4,6 +4,8 @@ import path from 'node:path'
 
 test('register, login, RAG documents, long output, continue, stop and history', async ({ page }) => {
   const failures: string[] = []
+  let documentListRequests = 0
+  page.on('request', request => { if (request.method() === 'GET' && /\/conversations\/[^/]+\/documents$/.test(new URL(request.url()).pathname)) documentListRequests++ })
   page.on('pageerror', error => failures.push(error.message))
   await page.addInitScript(() => localStorage.setItem('rythm_locale', 'en-US'))
   await page.goto('/')
@@ -54,6 +56,9 @@ test('register, login, RAG documents, long output, continue, stop and history', 
   await send('What is the ORION budget in these files?')
   await expect(page.locator('.message-sources').last()).toContainText('Page 1')
   await expect(page.locator('.message-sources').last()).toContainText('Image supplied for visual analysis')
+  const settledRequests = documentListRequests
+  await page.waitForTimeout(5500) // More than the processing poll interval; ready files must stay idle.
+  expect(documentListRequests).toBe(settledRequests)
   await page.screenshot({ path: 'test-results/rag-desktop.png', fullPage: true })
   await page.reload()
   await expect(page.locator('.conversation-item')).toHaveCount(1)
@@ -93,6 +98,9 @@ test('register, login, RAG documents, long output, continue, stop and history', 
   await page.getByRole('button', { name: 'Delete: budget.txt', exact: true }).click()
   await expect(page.locator('.attachment')).toHaveCount(5)
   await expect(page.locator('.message-sources').filter({ hasText: 'budget.txt' })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Reprocess: dropped.txt', exact: true }).click()
+  await expect(page.locator('.attachment--pending, .attachment--processing')).toHaveCount(1)
+  await expect(page.locator('.attachment--ready')).toHaveCount(5)
   await attachment.setInputFiles({ name: 'invalid.pdf', mimeType: 'application/pdf', buffer: Buffer.from('invalid pdf') })
   await expect(page.locator('.chat-error')).toContainText('File content does not match')
   await page.getByRole('checkbox', { name: 'Use for this question: dropped.txt' }).uncheck()

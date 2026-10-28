@@ -423,50 +423,11 @@ async def stream_message(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
 
-    max_sequence = await db.scalar(
-        select(func.max(Message.sequence_no)).where(Message.conversation_id == conversation.id)
-    )
-    user_message = Message(
-        conversation_id=conversation.id,
-        sequence_no=(max_sequence or 0) + 1,
-        role="user",
-        content=content,
-        status="completed",
-    )
-    db.add(user_message)
-    await db.flush()
-    assistant_message = Message(
-        conversation_id=conversation.id,
-        sequence_no=user_message.sequence_no + 1,
-        role="assistant",
-        content="",
-        status="streaming",
-        continuation_of_id=continuation.id if continuation else None,
-        model_profile_id=model.id,
-    )
-    db.add(assistant_message)
-    await db.flush()
-    generation = Generation(
-        user_id=auth.user.id,
-        conversation_id=conversation.id,
-        client_request_id=payload.client_request_id,
-        user_message_id=user_message.id,
-        assistant_message_id=assistant_message.id,
-        model_profile_id=model.id,
-    )
-    db.add(generation)
-    persist_sources(db, assistant_message.id, sources)
-    if (max_sequence or 0) == 0:
-        conversation.title = content[:30] + ("…" if len(content) > 30 else "")
-    conversation.updated_at = utc_now()
-    await db.commit()
-
     previous_rows = (
         await db.scalars(
             select(Message)
             .where(
                 Message.conversation_id == conversation.id,
-                Message.sequence_no < user_message.sequence_no,
                 Message.status == "completed",
             )
             .order_by(Message.sequence_no.asc())
@@ -497,11 +458,52 @@ async def stream_message(
             break
         history[0:0] = pair
         used_chars += pair_chars
-    generation.context_truncated = len(history) < len(candidate_history)
-    await db.commit()
+    context_truncated = len(history) < len(candidate_history)
 
     llm_messages[1:1] = [LLMMessage(role=item.role, content=item.content) for item in history]
-    max_tokens = output_budget(model, settings, llm_messages)
+    try:
+        max_tokens = output_budget(model, settings, llm_messages)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    max_sequence = await db.scalar(
+        select(func.max(Message.sequence_no)).where(Message.conversation_id == conversation.id)
+    )
+    user_message = Message(
+        conversation_id=conversation.id,
+        sequence_no=(max_sequence or 0) + 1,
+        role="user",
+        content=content,
+        status="completed",
+    )
+    db.add(user_message)
+    await db.flush()
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        sequence_no=user_message.sequence_no + 1,
+        role="assistant",
+        content="",
+        status="streaming",
+        continuation_of_id=continuation.id if continuation else None,
+        model_profile_id=model.id,
+    )
+    db.add(assistant_message)
+    await db.flush()
+    generation = Generation(
+        user_id=auth.user.id,
+        conversation_id=conversation.id,
+        client_request_id=payload.client_request_id,
+        user_message_id=user_message.id,
+        assistant_message_id=assistant_message.id,
+        model_profile_id=model.id,
+        context_truncated=context_truncated,
+    )
+    db.add(generation)
+    persist_sources(db, assistant_message.id, sources)
+    if (max_sequence or 0) == 0:
+        conversation.title = content[:30] + ("…" if len(content) > 30 else "")
+    conversation.updated_at = utc_now()
+    await db.commit()
+
     registry = request.app.state.provider_registry
     provider = registry.get(model.provider)
     actual_model_id = configured_model_id(model.provider, model.model_id, settings)

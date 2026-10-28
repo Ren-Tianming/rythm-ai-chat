@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 
 from app.core.config import get_settings
 from app.core.security import utc_now
-from app.db.models import Document, DocumentChunk, DocumentUsage
+from app.db.models import Document, DocumentChunk, DocumentUsage, User
 from app.db.session import SessionLocal
 from app.services.document_storage import private_path
 from app.services.embeddings import EmbeddingError, embed_texts
@@ -115,6 +115,8 @@ async def process_document(item, session_factory=SessionLocal, settings=None):
                 )
                 vectors.extend(batch)
                 async with session_factory() as db:
+                    # Match upload/delete/retrieval lock order before the usage FK write.
+                    await db.scalar(select(User.id).where(User.id == item.user_id).with_for_update())
                     current = await db.get(Document, item.id, with_for_update=True)
                     if not current or current.processing_token != item.processing_token:
                         return

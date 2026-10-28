@@ -375,3 +375,65 @@ async def test_context_budget_failure_is_not_misreported_as_no_document_evidence
     assert response.status_code == 422
     assert "context budget" in response.text
     assert not system.provider.calls
+
+
+@pytest.mark.asyncio
+async def test_full_history_cost_budget_rejects_without_creating_active_generation(system):
+    from app.db.models import Generation, Message, ModelProfile
+    async with system.factory() as db:
+        model = await db.get(ModelProfile, system.model.id)
+        model.config_json = {"context_window_tokens": 65536, "max_generation_cost_usd": 0.05}
+        model.input_price_per_million = 100
+        model.output_price_per_million = 100
+        db.add_all([
+            Message(conversation_id=system.conversations[0].id, sequence_no=1, role="user", content="x" * 2000, status="completed"),
+            Message(conversation_id=system.conversations[0].id, sequence_no=2, role="assistant", content="y" * 2000, status="completed"),
+        ])
+        await db.commit()
+    response = await chat(system, "hello")
+    assert response.status_code == 422
+    async with system.factory() as db:
+        assert await db.scalar(select(func.count(Generation.id))) == 0
+        assert await db.scalar(select(func.count(Message.id))) == 2
+        model = await db.get(ModelProfile, system.model.id)
+        model.config_json = {"context_window_tokens": 65536}
+        await db.commit()
+    assert (await chat(system, "Still usable")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_index_usage_does_not_reverse_user_document_lock_order(system, monkeypatch):
+    import asyncio
+    from sqlalchemy import text
+    from app.db.models import User
+    from app.services import document_worker
+    await upload(system)
+    item = await claim_document(system.factory, system.settings)
+    embedded = asyncio.Event()
+    original = document_worker.embed_texts
+    async def observed_embedding(texts, settings):
+        result = await original(texts, settings)
+        embedded.set()
+        return result
+    monkeypatch.setattr(document_worker, "embed_texts", observed_embedding)
+    async with system.factory() as blocker:
+        await blocker.scalar(select(User.id).where(User.id == system.users[0].id).with_for_update())
+        task = asyncio.create_task(process_document(item, system.factory, system.settings))
+        try:
+            await asyncio.wait_for(embedded.wait(), 5)
+            # Wait for the worker to reach a user lock (or, before the fix, its usage FK).
+            for _ in range(100):
+                await blocker.execute(text("SELECT pg_stat_clear_snapshot()"))
+                waiting = await blocker.scalar(text("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock')"))
+                if waiting:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("Worker did not reach the expected lock")
+            # Deletion holds the user first and must still be able to lock this document.
+            assert await blocker.scalar(select(Document.id).where(Document.id == item.id).with_for_update(nowait=True)) == item.id
+        finally:
+            await blocker.rollback()
+            await asyncio.wait_for(task, 10)
+    async with system.factory() as db:
+        assert (await db.get(Document, item.id)).status == "ready"

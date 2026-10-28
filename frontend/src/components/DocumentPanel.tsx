@@ -23,15 +23,49 @@ export function DocumentPanel({ conversationId, ensureConversation, selected, on
   const currentId = useRef(conversationId)
   currentId.current = conversationId
   useEffect(() => { void api.documentLimits().then(setLimits).catch(() => {}) }, [])
+  const needsProcessing = documents.some(doc => doc.status === 'pending' || doc.status === 'processing')
   useEffect(() => {
     let live = true
     setDocuments([]); setPreview(null)
     if (!conversationId) return
-    const refresh = () => api.documents(conversationId).then((rows) => { if (live) setDocuments(rows) }).catch((e: Error) => { if (live) onError(e.message) })
-    void refresh()
-    const timer = window.setInterval(() => void refresh(), 2500)
-    return () => { live = false; window.clearInterval(timer) }
-  }, [conversationId]) // onError changes identity every render; polling is scoped to the conversation.
+    const refresh = () => {
+      if (document.visibilityState !== 'visible') return
+      void api.documents(conversationId).then(rows => { if (live) setDocuments(rows) })
+        .catch((e: Error) => { if (live) onError(e.message) })
+    }
+    refresh()
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      live = false
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [conversationId, onError])
+  useEffect(() => {
+    if (!conversationId || !needsProcessing) return
+    let live = true
+    let timer: number
+    let delay = 5000
+    const poll = async () => {
+      if (document.visibilityState === 'visible') {
+        try {
+          const rows = await api.documents(conversationId)
+          if (!live) return
+          setDocuments(rows)
+          delay = 5000
+          if (!rows.some(doc => doc.status === 'pending' || doc.status === 'processing')) return
+        } catch (e) {
+          if (!live) return
+          onError(e instanceof Error ? e.message : t('error'))
+          delay = Math.min(delay * 2, 30000)
+        }
+      }
+      if (live) timer = window.setTimeout(() => void poll(), delay)
+    }
+    timer = window.setTimeout(() => void poll(), delay)
+    return () => { live = false; window.clearTimeout(timer) }
+  }, [conversationId, needsProcessing, onError, t])
   useEffect(() => { onBusy(uploading || documents.some(d => selected.includes(d.id) && (d.status !== 'ready' || d.requires_reindex))) }, [uploading, documents, selected, onBusy])
 
   const upload = async (files: FileList | File[]) => {
