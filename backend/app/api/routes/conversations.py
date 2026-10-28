@@ -478,7 +478,13 @@ async def stream_message(
     )
     budget = max(
         0,
-        min(settings.max_context_chars, context_window - max_tokens - 2048 * len(images) - 512)
+        min(
+            settings.max_context_chars,
+            context_window
+            - max_tokens
+            - int((model.config_json or {}).get("vision_tokens_per_image", 4096)) * len(images)
+            - 512,
+        )
         - len(system_prompt.encode())
         - len(request_content.encode()),
     )

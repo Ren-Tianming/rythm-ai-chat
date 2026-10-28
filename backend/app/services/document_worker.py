@@ -43,9 +43,18 @@ async def parse_document(item, settings):
     )
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), settings.document_parse_timeout)
-        parsed = json.loads(stdout)
+        if not stdout:
+            raise ValueError(
+                "File parsing/OCR exceeded resource limits or failed; try a smaller file"
+            )
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            raise ValueError(
+                "File parser returned an invalid result; retry or use a smaller file"
+            ) from None
         if process.returncode or parsed.get("error"):
-            raise ValueError(parsed.get("error", "Parser failed"))
+            raise ValueError(parsed.get("error", "File parsing/OCR failed; try a smaller file"))
         return parsed["pages"]
     except TimeoutError:
         raise ValueError("Document processing timed out; use a smaller file") from None

@@ -17,7 +17,8 @@ def count_tokens(text: str) -> int:
 def output_budget(model: ModelProfile, settings: Settings, messages) -> int:
     config = model.config_json or {}
     # UTF-8 bytes are a conservative upper bound for byte-BPE input models.
-    input_budget = sum(len(m.content.encode("utf-8")) + 16 for m in messages) + 2048 * sum(
+    image_tokens = int(config.get("vision_tokens_per_image", 4096))
+    input_budget = sum(len(m.content.encode("utf-8")) + 16 for m in messages) + image_tokens * sum(
         len(m.images) for m in messages
     )
     remaining = int(config.get("context_window_tokens", 32768)) - input_budget - 256
@@ -25,6 +26,8 @@ def output_budget(model: ModelProfile, settings: Settings, messages) -> int:
     if settings.max_output_tokens is not None:
         limits.append(settings.max_output_tokens)
     cost_cap = config.get("max_generation_cost_usd")
+    if cost_cap is not None and model.output_price_per_million is None:
+        raise ValueError("A monetary generation budget requires model pricing to be configured")
     if cost_cap is not None and model.output_price_per_million:
         available = float(cost_cap) * 1_000_000 - input_budget * float(
             model.input_price_per_million or 0

@@ -93,6 +93,8 @@ async def retrieve(
             )
     elif image_docs:
         warnings.append("OCR_ONLY")
+    image_budget = int((model.config_json or {}).get("vision_tokens_per_image", 4096)) * len(images)
+    budget_bytes = max(0, budget_bytes - image_budget)
     candidates = []
     if await db.scalar(select(DocumentChunk.id).where(DocumentChunk.document_id.in_(ids)).limit(1)):
         try:

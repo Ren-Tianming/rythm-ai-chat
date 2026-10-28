@@ -17,6 +17,7 @@ test('register, login, RAG documents, long output, continue, stop and history', 
   await expect(page.getByText('Verification email sent. Check your inbox.')).toBeVisible()
   const token = JSON.parse(fs.readFileSync(process.env.E2E_MAIL_FILE!, 'utf-8')).token
   await page.goto(`/#verify=${token}`)
+  await page.reload() // Email links open a fresh document; hash-only navigation does not remount React.
   await expect(page.getByText('Email verified. You can now sign in.')).toBeVisible()
   await page.getByLabel('Email', { exact: true }).fill('browser@example.com')
   await page.getByLabel('Password', { exact: true }).fill('Secure_Browser_Pass_2026!')
