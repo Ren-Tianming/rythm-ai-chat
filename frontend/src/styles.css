@@ -129,7 +129,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .icon-button:hover { color: #fff; background: rgba(255,255,255,.06); }
 .icon-button.danger:hover { color: var(--danger); }
 
-.chat-main { min-width: 0; height: 100vh; display: grid; grid-template-rows: 68px minmax(0,1fr) auto; position: relative; }
+.chat-main { min-width: 0; height: 100vh; display: grid; grid-template-columns: minmax(0,1fr); grid-template-rows: 68px minmax(0,1fr) auto; position: relative; }
 .chat-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 28px; border-bottom: 1px solid rgba(255,255,255,.055); background: rgba(7,5,16,.66); backdrop-filter: blur(18px); z-index: 5; }
 .chat-title { min-width: 0; flex: 1; overflow: hidden; color: #a9a1b7; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-select { height: 40px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 11px; padding: 0 11px; background: rgba(255,255,255,.035); }
