@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.security import utc_now
@@ -104,11 +105,11 @@ class ModelProfile(Base, TimestampMixin):
     description_key: Mapped[str] = mapped_column(String(120), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    max_output_tokens: Mapped[int] = mapped_column(Integer, default=512, nullable=False)
+    max_output_tokens: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
     display_name_i18n: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     context_rounds: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
-    default_output_tokens: Mapped[int] = mapped_column(Integer, default=512, nullable=False)
+    default_output_tokens: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
     input_price_per_million: Mapped[float | None] = mapped_column(Numeric(12, 6))
     output_price_per_million: Mapped[float | None] = mapped_column(Numeric(12, 6))
     pricing_version: Mapped[str | None] = mapped_column(String(40))
@@ -150,6 +151,9 @@ class Message(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     finish_reason: Mapped[str | None] = mapped_column(String(80))
+    continuation_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -229,4 +233,73 @@ class UserConsent(Base):
     document_type: Mapped[str] = mapped_column(String(40), nullable=False)
     document_version: Mapped[str] = mapped_column(String(40), nullable=False)
     ip_address: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Document(Base, TimestampMixin):
+    __tablename__ = "documents"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','processing','ready','failed')"),
+        Index("ix_documents_owner_conversation", "user_id", "conversation_id"),
+        Index("ix_documents_queue", "status", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    filename: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(80), unique=True)
+    mime_type: Mapped[str] = mapped_column(String(80))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(String(300))
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    embedding_model: Mapped[str | None] = mapped_column(String(160))
+    embedding_version: Mapped[str | None] = mapped_column(String(160))
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer)
+    processing_token: Mapped[uuid.UUID | None] = mapped_column()
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+    __table_args__ = (Index("ix_document_chunks_document", "document_id"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    page_number: Mapped[int | None] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int] = mapped_column(Integer)
+    # Unbounded Vector allows coexistence of model versions/dimensions. Filter before distance.
+    embedding: Mapped[list[float]] = mapped_column(Vector().with_variant(JSON(), "sqlite"))
+    embedding_model: Mapped[str] = mapped_column(String(160))
+    embedding_version: Mapped[str] = mapped_column(String(160))
+    embedding_dimensions: Mapped[int] = mapped_column(Integer)
+
+
+class MessageSource(Base):
+    __tablename__ = "message_sources"
+    __table_args__ = (Index("ix_message_sources_message", "message_id"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
+    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="CASCADE")
+    )
+    source_kind: Mapped[str] = mapped_column(String(16), default="retrieval")
+    label: Mapped[str] = mapped_column(String(16))
+    excerpt: Mapped[str] = mapped_column(Text)
+    similarity: Mapped[float] = mapped_column(Numeric(8, 6))
+
+
+class DocumentUsage(Base):
+    __tablename__ = "document_usage"
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid_pk)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    model: Mapped[str] = mapped_column(String(160))
+    purpose: Mapped[str] = mapped_column(String(16))
+    input_tokens: Mapped[int] = mapped_column(Integer)
+    estimated_cost_microusd: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

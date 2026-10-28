@@ -17,6 +17,7 @@ export interface ModelProfile {
   description_key: string
   is_default: boolean
   max_output_tokens: number
+  supports_vision: boolean
 }
 
 export interface Conversation {
@@ -37,6 +38,8 @@ export interface ChatMessage {
   model_profile_id: string | null
   input_tokens: number | null
   output_tokens: number | null
+  finish_reason?: string | null
+  sources?: MessageSource[]
   created_at: string
 }
 
@@ -55,4 +58,16 @@ export interface UserSession {
   last_seen_at: string
   created_at: string
   current: boolean
+}
+
+export interface MessageSource {
+  id?: string; label: string; document_id: string; chunk_id: string | null
+  filename: string; page_number: number | null; excerpt: string; similarity: number
+  source_kind: 'retrieval' | 'vision'
+}
+export interface DocumentInfo {
+  id: string; conversation_id: string; filename: string; mime_type: string
+  size_bytes: number; status: 'pending' | 'processing' | 'ready' | 'failed'
+  progress: number; error: string | null; page_count: number | null; created_at: string
+  requires_reindex: boolean; preview?: { page_number: number | null; content: string }[]
 }

@@ -9,6 +9,8 @@ import type { ChatMessage, Conversation, ModelProfile, UsageSummary, User } from
 import { Brand } from './Brand'
 import { LanguagePicker } from './LanguagePicker'
 import { SettingsModal } from './SettingsModal'
+import { DocumentPanel } from './DocumentPanel'
+import { MessageSources } from './MessageSources'
 
 interface Props { user: User; onLogout: () => void; onUserChange: (user: User) => void }
 
@@ -21,6 +23,8 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
   const [active, setActive] = useState<Conversation | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  const [selectedDocuments, setSelectedDocuments] = useState<string[]>([])
+  const [documentsBusy, setDocumentsBusy] = useState(false)
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [error, setError] = useState('')
@@ -46,13 +50,15 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
   const activeModel = useMemo(() => models.find((item) => item.id === (active?.model_profile_id || selectedModel)), [models, active, selectedModel])
 
   const openConversation = async (conversation: Conversation) => {
-    setActive(conversation); setSelectedModel(conversation.model_profile_id); setSidebarOpen(false); setError('')
+    if (streaming || documentsBusy) return
+    setSelectedDocuments([]); setActive(conversation); setSelectedModel(conversation.model_profile_id); setSidebarOpen(false); setError('')
     try { setMessages(await api.messages(conversation.id)) } catch (reason) { setError(reason instanceof Error ? reason.message : t('error')) }
   }
 
-  const newConversation = () => { setActive(null); setMessages([]); setSidebarOpen(false); setError('') }
+  const newConversation = () => { if (streaming || documentsBusy) return; setSelectedDocuments([]); setActive(null); setMessages([]); setSidebarOpen(false); setError('') }
 
   const chooseModel = async (modelId: string) => {
+    if (streaming) return
     setSelectedModel(modelId)
     if (active) {
       try {
@@ -63,6 +69,7 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
   }
 
   const deleteConversation = async (conversation: Conversation) => {
+    if (streaming || documentsBusy) return
     if (!window.confirm(t('deleteConfirm'))) return
     await api.deleteConversation(conversation.id)
     setConversations((list) => list.filter((item) => item.id !== conversation.id))
@@ -70,6 +77,7 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
   }
 
   const archiveConversation = async (conversation: Conversation) => {
+    if (streaming || documentsBusy) return
     await api.updateConversation(conversation.id, { archived: !conversation.archived })
     setConversations((list) => list.filter((item) => item.id !== conversation.id))
     if (active?.id === conversation.id) newConversation()
@@ -83,11 +91,18 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     if (active?.id === updated.id) setActive(updated)
   }
 
-  const submit = async (event?: FormEvent) => {
+  const ensureConversation = async () => {
+    if (active) return active.id
+    const conversation = await api.createConversation(selectedModel)
+    setActive(conversation); setConversations(list => [conversation, ...list])
+    return conversation.id
+  }
+
+  const submit = async (event?: FormEvent, continuation?: ChatMessage) => {
     event?.preventDefault()
-    const content = input.trim()
-    if (!content || streaming || !selectedModel) return
-    setInput(''); setError(''); setStreaming(true)
+    const content = continuation ? t('continuePrompt') : input.trim()
+    if (!content || streaming || documentsBusy || !selectedModel) return
+    if (!continuation) setInput(''); setError(''); setStreaming(true)
     let conversation = active
     try {
       if (!conversation) {
@@ -102,23 +117,26 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
       const clientRequestId = crypto.randomUUID()
       let streamError = ''
       await streamChat(conversation.id, content, clientRequestId, selectedModel, controller.signal, {
-        onMetadata: (data) => { generationIdRef.current = String(data.generation_id || '') || null },
+        onMetadata: (data) => {
+          generationIdRef.current = String(data.generation_id || '') || null
+          setMessages(list => list.map(item => item.id === assistantId ? { ...item, sources: (data.sources || []) as ChatMessage['sources'] } : item))
+        },
         onDelta: (text) => setMessages((list) => list.map((item) => item.id === assistantId ? { ...item, content: item.content + text } : item)),
         onError: (message) => { streamError = message },
-      })
+      }, continuation ? [...new Set(continuation.sources?.map(source => source.document_id) || [])] : selectedDocuments, continuation?.id)
       if (streamError) throw new Error(streamError)
       setMessages(await api.messages(conversation.id))
       await Promise.all([loadConversations(), api.usage().then(setUsage)])
     } catch (reason) {
       if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : t('error'))
-      if (conversation) void api.messages(conversation.id).then(setMessages)
+      if (conversation) await api.messages(conversation.id).then(setMessages).catch(() => {})
     } finally { setStreaming(false); abortRef.current = null; generationIdRef.current = null }
   }
 
   const stopGeneration = async () => {
     const generationId = generationIdRef.current
     if (generationId) {
-      try { await api.cancelGeneration(generationId) } catch { /* Disconnect still cancels. */ }
+      try { await api.cancelGeneration(generationId); return } catch { /* Disconnect still cancels. */ }
     }
     abortRef.current?.abort()
   }
@@ -148,13 +166,18 @@ export function ChatApp({ user, onLogout, onUserChange }: Props) {
     </aside>
     {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />}
     <main className="chat-main">
-      <header className="chat-header"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu /></button><div className="chat-title">{active?.title}</div><div className="model-select"><span><Sparkles size={15} />{t('model')}</span><select value={active?.model_profile_id || selectedModel} onChange={(e) => void chooseModel(e.target.value)}>{models.map((model) => <option value={model.id} key={model.id}>{model.display_name}</option>)}</select><ChevronDown size={16} /></div><div className="header-actions"><span className="secure-indicator"><i /> {t('contextLabel')}</span><LanguagePicker onChange={(locale) => void api.updateMe({ locale }).then(onUserChange).catch(() => onUserChange({ ...user, locale }))} /></div></header>
+      <header className="chat-header"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu /></button><div className="chat-title">{active?.title}</div><div className="model-select"><span><Sparkles size={15} />{t('model')}</span><select disabled={streaming || documentsBusy} value={active?.model_profile_id || selectedModel} onChange={(e) => void chooseModel(e.target.value)}>{models.map((model) => <option value={model.id} key={model.id}>{model.display_name}</option>)}</select><ChevronDown size={16} /></div><div className="header-actions"><span className="secure-indicator"><i /> {t('contextLabel')}</span><LanguagePicker onChange={(locale) => void api.updateMe({ locale }).then(onUserChange).catch(() => onUserChange({ ...user, locale }))} /></div></header>
       <section className="messages"><div className="messages__inner">{messages.length === 0 ? (
         <motion.div className="empty-chat" initial={{ opacity: 0, scale: .98 }} animate={{ opacity: 1, scale: 1 }}><div className="empty-chat__logo"><img src="/rythm-logo.png" alt="" /></div><h1>{t('welcome')}</h1><p>{t('welcomeHint')}</p><div className="example-prompts">{['example1', 'example2', 'example3'].map((key) => <button key={key} onClick={() => setInput(t(key))}>{t(key)}</button>)}</div><div className="model-cards">{models.map((model) => <button key={model.id} className={selectedModel === model.id ? 'active' : ''} onClick={() => void chooseModel(model.id)}><span>{model.provider.slice(0, 1).toUpperCase()}</span><div><strong>{model.display_name}</strong><small>{t(model.description_key)}</small></div></button>)}</div></motion.div>
       ) : messages.map((message) => (
-        <motion.article className={`message message--${message.role}`} key={message.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><div className="message__avatar">{message.role === 'assistant' ? <Bot size={20} /> : <UserRound size={20} />}</div><div className="message__body"><header><strong>{message.role === 'assistant' ? 'RyThM' : (user.display_name || t('you'))}</strong>{message.role === 'assistant' && <span>{models.find((m) => m.id === message.model_profile_id)?.display_name || activeModel?.display_name}</span>}</header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (props) => <a {...props} rel="noopener noreferrer" target="_blank" /> }}>{message.content || (streaming ? '● ● ●' : '')}</ReactMarkdown></div>{message.output_tokens !== null && <small className="token-meta">{message.output_tokens} {t('outputTokens')}</small>}</div></motion.article>
+        <motion.article className={`message message--${message.role}`} key={message.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><div className="message__avatar">{message.role === 'assistant' ? <Bot size={20} /> : <UserRound size={20} />}</div><div className="message__body"><header><strong>{message.role === 'assistant' ? 'RyThM' : (user.display_name || t('you'))}</strong>{message.role === 'assistant' && <span>{models.find((m) => m.id === message.model_profile_id)?.display_name || activeModel?.display_name}</span>}</header><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (props) => <a {...props} rel="noopener noreferrer" target="_blank" /> }}>{message.content || (streaming ? '● ● ●' : '')}</ReactMarkdown></div>{message.sources && <MessageSources sources={message.sources} />}
+          {['length', 'MAX_TOKENS', 'max_tokens'].includes(message.finish_reason || '') && <p className="generation-notice">{t('outputTruncated')}</p>}
+          {message.status === 'cancelled' && <p className="generation-notice">{t('generationStopped')}</p>}
+          {message.role === 'assistant' && message.id === messages.at(-1)?.id && message.content && (['length', 'MAX_TOKENS', 'max_tokens'].includes(message.finish_reason || '') || ['cancelled', 'failed'].includes(message.status)) && <button className="continue-button" disabled={streaming || documentsBusy} onClick={() => void submit(undefined, message)}>{t('continueGeneration')}</button>}
+          {message.output_tokens !== null && <small className="token-meta">{message.output_tokens} {t('outputTokens')}</small>}</div></motion.article>
       ))}<div ref={endRef} />{error && <div className="notice notice--error chat-error">{error}</div>}</div></section>
-      <footer className="composer-wrap"><form className="composer" onSubmit={(e) => void submit(e)}><textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKeyDown} placeholder={t('placeholder')} maxLength={4000} rows={1} disabled={streaming} /><div className="composer__bottom"><span>{input.length}/4000 · {activeModel?.display_name}</span>{streaming ? <button type="button" className="send-button stop" onClick={() => void stopGeneration()} title={t('stop')}><Square size={17} /></button> : <button className="send-button" disabled={!input.trim() || !selectedModel} title={t('send')}><Send size={18} /></button>}</div></form><p>{t('providerNotice')}</p></footer>
+      <footer className="composer-wrap"><DocumentPanel conversationId={active?.id} ensureConversation={ensureConversation} selected={selectedDocuments} onSelected={setSelectedDocuments} disabled={streaming || !selectedModel} vision={!!activeModel?.supports_vision} onError={setError} onBusy={setDocumentsBusy}
+        onDocumentRemoved={id => setMessages(list => list.map(message => ({ ...message, sources: message.sources?.filter(source => source.document_id !== id) })))}><form className="composer" onSubmit={(e) => void submit(e)}><textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKeyDown} placeholder={t('placeholder')} maxLength={4000} rows={1} disabled={streaming} /><div className="composer__bottom"><span>{input.length}/4000 · {activeModel?.display_name}</span>{streaming ? <button type="button" className="send-button stop" onClick={() => void stopGeneration()} title={t('stop')}><Square size={17} /></button> : <button className="send-button" disabled={!input.trim() || !selectedModel || documentsBusy} title={t('send')}><Send size={18} /></button>}</div></form></DocumentPanel><p>{t('providerNotice')}</p></footer>
     </main>
     <SettingsModal open={settingsOpen} user={user} onClose={() => setSettingsOpen(false)} onUserChange={onUserChange} />
   </div>

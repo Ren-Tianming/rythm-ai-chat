@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     restart: unless-stopped
     mem_limit: 768m
     cpus: 0.75
@@ -35,7 +35,7 @@ services:
         max-size: 10m
         max-file: "3"
 
-  backend:
+  backend: &backend-service
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -47,6 +47,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rythm}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-rythm_chatbot}
       FORWARDED_ALLOW_IPS: 172.16.0.0/12
       WEB_CONCURRENCY: "1"
+    volumes:
+      - uploads_data:/app/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -57,6 +59,18 @@ services:
       retries: 5
     networks: [internal]
     logging: *default-logging
+
+  document-worker:
+    <<: *backend-service
+    entrypoint: ["python", "-m", "app.services.document_worker"]
+    healthcheck:
+      disable: true
+    depends_on:
+      backend:
+        condition: service_healthy
+    # Parser memory is bounded per child; at most one document is processed at a time.
+    mem_limit: 1024m
+    cpus: 0.75
 
   web:
     build:
@@ -81,3 +95,4 @@ networks:
 
 volumes:
   postgres_data:
+  uploads_data:

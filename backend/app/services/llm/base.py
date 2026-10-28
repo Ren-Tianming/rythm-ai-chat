@@ -1,6 +1,6 @@
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -9,6 +9,7 @@ import httpx
 class LLMMessage:
     role: str
     content: str
+    images: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -63,7 +64,26 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             raise ProviderError("MODEL_NOT_CONFIGURED", "The selected model is not configured")
         payload = {
             "model": model_id,
-            "messages": [{"role": message.role, "content": message.content} for message in messages],
+            "messages": [
+                {
+                    "role": message.role,
+                    "content": (
+                        [{"type": "text", "text": message.content}]
+                        + [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{image['mime_type']};base64,{image['data']}"
+                                },
+                            }
+                            for image in message.images
+                        ]
+                    )
+                    if message.images
+                    else message.content,
+                }
+                for message in messages
+            ],
             "max_tokens": max_tokens,
             "temperature": 0.7,
             "stream": True,
@@ -72,50 +92,48 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
             async with self.client.stream(
-                    "POST", f"{self.base_url}/chat/completions", json=payload, headers=headers
-                ) as response:
-                    if response.status_code >= 400:
-                        await response.aread()
-                        if response.status_code == 429:
-                            raise ProviderError(
-                                "MODEL_RATE_LIMITED",
-                                "The model is temporarily rate limited",
-                                retryable=True,
-                            )
-                        if response.status_code in {401, 403}:
-                            raise ProviderError(
-                                "MODEL_AUTH_FAILED", "The model is temporarily unavailable"
-                            )
-                        if response.status_code == 404:
-                            raise ProviderError(
-                                "MODEL_NOT_FOUND", "The selected model is unavailable"
-                            )
+                "POST", f"{self.base_url}/chat/completions", json=payload, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    if response.status_code == 429:
                         raise ProviderError(
-                            "MODEL_UPSTREAM_ERROR",
-                            "The model service returned an error",
-                            retryable=response.status_code >= 500,
+                            "MODEL_RATE_LIMITED",
+                            "The model is temporarily rate limited",
+                            retryable=True,
                         )
-                    request_id = response.headers.get("x-request-id")
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if not data or data == "[DONE]":
-                            continue
-                        try:
-                            item = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        choice = (item.get("choices") or [{}])[0]
-                        delta = choice.get("delta") or {}
-                        usage = item.get("usage") or {}
-                        yield ProviderEvent(
-                            text=delta.get("content") or "",
-                            input_tokens=usage.get("prompt_tokens"),
-                            output_tokens=usage.get("completion_tokens"),
-                            finish_reason=choice.get("finish_reason"),
-                            request_id=request_id or item.get("id"),
+                    if response.status_code in {401, 403}:
+                        raise ProviderError(
+                            "MODEL_AUTH_FAILED", "The model is temporarily unavailable"
                         )
+                    if response.status_code == 404:
+                        raise ProviderError("MODEL_NOT_FOUND", "The selected model is unavailable")
+                    raise ProviderError(
+                        "MODEL_UPSTREAM_ERROR",
+                        "The model service returned an error",
+                        retryable=response.status_code >= 500,
+                    )
+                request_id = response.headers.get("x-request-id")
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        item = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (item.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    usage = item.get("usage") or {}
+                    yield ProviderEvent(
+                        text=delta.get("content") or "",
+                        input_tokens=usage.get("prompt_tokens"),
+                        output_tokens=usage.get("completion_tokens"),
+                        finish_reason=choice.get("finish_reason"),
+                        request_id=request_id or item.get("id"),
+                    )
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 "MODEL_TIMEOUT", "The model response timed out", 504, retryable=True

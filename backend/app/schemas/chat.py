@@ -12,6 +12,7 @@ class ModelProfileResponse(BaseModel):
     description_key: str
     is_default: bool
     max_output_tokens: int
+    supports_vision: bool = False
 
 
 class ConversationCreate(BaseModel):
@@ -37,6 +38,8 @@ class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     model_profile_id: uuid.UUID | None = None
     client_request_id: uuid.UUID
+    document_ids: list[uuid.UUID] = Field(default_factory=list, max_length=50)
+    continue_message_id: uuid.UUID | None = None
 
 
 class ChatMessageResponse(BaseModel):
@@ -49,6 +52,8 @@ class ChatMessageResponse(BaseModel):
     input_tokens: int | None
     output_tokens: int | None
     created_at: datetime
+    finish_reason: str | None = None
+    sources: list[dict] = Field(default_factory=list)
 
 
 class UsageSummaryResponse(BaseModel):

@@ -29,17 +29,39 @@ class Settings(BaseSettings):
 
     max_input_chars: int = Field(default=4000, ge=1, le=16000)
     max_context_chars: int = Field(default=16000, ge=4000, le=100000)
-    max_output_tokens: int = Field(default=512, ge=1, le=1024)
+    max_output_tokens: int | None = Field(default=None, ge=1)
     context_rounds: int = Field(default=5, ge=1, le=5)
     daily_chat_limit: int = Field(default=50, ge=1, le=10000)
     chat_per_minute_limit: int = Field(default=5, ge=1, le=100)
     max_concurrent_generations_per_user: int = Field(default=1, ge=1, le=10)
-    generation_timeout_seconds: float = Field(default=120.0, ge=30.0, le=600.0)
-    provider_timeout_seconds: float = 60.0
+    generation_timeout_seconds: float = Field(default=600.0, ge=30.0, le=1800.0)
+    provider_timeout_seconds: float = 120.0
     system_prompt: str = (
-        "You are RyThM Chatbot, a concise, accurate multilingual assistant. "
+        "You are RyThM Chatbot, an accurate multilingual assistant. Match the depth requested by the user. "
         "Reply in the user's language unless asked otherwise."
     )
+
+    # Optional global cost cap; unset means use the model's configured budget.
+    upload_dir: str = "/app/uploads"
+    document_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
+    document_batch_limit: int = Field(default=5, ge=1, le=20)
+    document_user_limit: int = Field(default=50, ge=1)
+    document_user_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
+    document_pdf_pages: int = Field(default=100, ge=1, le=1000)
+    document_max_chars: int = Field(default=1000000, ge=1000)
+    document_parse_timeout: int = Field(default=180, ge=10, le=600)
+    ocr_languages: str = "jpn+chi_sim+eng"
+    embedding_base_url: str = "https://api.openai.com/v1"
+    embedding_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
+    embedding_version: str = "text-embedding-3-small-v1"
+    embedding_dimensions: int = Field(default=1536, ge=1, le=4096)
+    embedding_price_per_million: float = Field(default=0.02, ge=0)
+    rag_top_k: int = Field(default=6, ge=5, le=8)
+    rag_min_similarity: float = Field(default=0.25, ge=-1, le=1)
+    rag_context_tokens: int = Field(default=6000, ge=1000, le=16000)
+    chunk_tokens: int = Field(default=650, ge=500, le=800)
+    chunk_overlap_tokens: int = Field(default=80, ge=0, le=150)
 
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -126,7 +148,10 @@ class Settings(BaseSettings):
 
     @property
     def allowed_csrf_origins(self) -> set[str]:
-        return {self.frontend_url.rstrip("/"), *(item.rstrip("/") for item in self.csrf_trusted_origins)}
+        return {
+            self.frontend_url.rstrip("/"),
+            *(item.rstrip("/") for item in self.csrf_trusted_origins),
+        }
 
 
 @lru_cache
