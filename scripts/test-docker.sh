@@ -21,7 +21,10 @@ cleanup() {
 }
 trap cleanup EXIT
 docker compose --env-file "$ENV_FILE" config -q
-docker compose --env-file "$ENV_FILE" up -d --build --wait --wait-timeout 180
+docker compose --env-file "$ENV_FILE" up -d --build --wait --wait-timeout 180 db backend web
+docker compose --env-file "$ENV_FILE" up -d document-worker
+worker_id="$(docker compose --env-file "$ENV_FILE" ps -q document-worker)"
+test "$(docker inspect --format '{{.State.Running}}' "$worker_id")" = true
 curl --fail --retry 5 --retry-delay 1 http://127.0.0.1:18081/api/v1/health/ready
 # Test files are never exposed by the web container/static route.
 docker compose --env-file "$ENV_FILE" exec -T backend python - seed < scripts/docker-smoke-data.py
