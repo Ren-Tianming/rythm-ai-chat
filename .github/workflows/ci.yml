@@ -55,10 +55,12 @@ jobs:
       - run: npx playwright install chromium --with-deps
         working-directory: frontend
       - run: ../scripts/test-browser.sh
+      - run: ../scripts/test-docker.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: browser-results
+          retention-days: 7
           path: frontend/test-results/
 
 
