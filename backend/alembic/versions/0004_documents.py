@@ -37,7 +37,7 @@ def upgrade():
     )
     # Migrate old short defaults; preserve explicit administrator budgets.
     op.execute(
-        "UPDATE model_profiles SET max_output_tokens = 8192, default_output_tokens = 8192 WHERE max_output_tokens <= 1024"
+        "UPDATE model_profiles SET max_output_tokens = 8192, default_output_tokens = 8192 WHERE max_output_tokens = 512 AND default_output_tokens = 512 AND slug IN ('deepseek-v4-flash','gemini-3-1-flash-lite','groq-gpt-oss-20b')"
     )
     op.execute(
         "UPDATE model_profiles SET config_json = jsonb_set(config_json::jsonb, '{supports_vision}', 'true')::json WHERE model_id = 'gemini-3.1-flash-lite' AND NOT config_json::jsonb ? 'supports_vision'"
