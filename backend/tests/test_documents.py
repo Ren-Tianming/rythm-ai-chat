@@ -364,3 +364,14 @@ async def test_pdf_page_limit_and_malformed_parser_failure_do_not_break_chat(sys
     metadata = (await system.client.get(f"/api/v1/documents/{doc['id']}")).json()
     assert metadata["status"] == "failed" and "1" in metadata["error"]
     assert (await chat(system)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_context_budget_failure_is_not_misreported_as_no_document_evidence(system):
+    doc = await upload(system)
+    await process(system)
+    system.settings.rag_context_tokens = 1
+    response = await chat(system, ids=[doc["id"]])
+    assert response.status_code == 422
+    assert "context budget" in response.text
+    assert not system.provider.calls

@@ -23,6 +23,7 @@ test('register, login, RAG documents, long output, continue, stop and history', 
   await page.getByLabel('Password', { exact: true }).fill('Secure_Browser_Pass_2026!')
   await page.locator('form').getByRole('button', { name: 'Sign in', exact: true }).click()
   await expect(page.locator('.chat-layout')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Attach files', exact: true })).toBeEnabled()
   const attachment = page.locator('input[type=file]')
   await attachment.setInputFiles([
     { name: 'budget.txt', mimeType: 'text/plain', buffer: Buffer.from('ORION budget is 4200000 yen. Deadline is November 30.') },

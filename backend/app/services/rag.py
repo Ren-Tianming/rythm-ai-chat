@@ -190,6 +190,11 @@ async def retrieve(
                 "source_kind": "retrieval",
             }
         )
+    if not sources and any(score >= settings.rag_min_similarity for _, score in candidates):
+        raise HTTPException(
+            422,
+            "Relevant evidence does not fit the context budget; shorten your question or select fewer files",
+        )
     for index, source in enumerate(sources, 1):
         source["label"] = f"S{index}"
     if images:

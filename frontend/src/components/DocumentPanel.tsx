@@ -65,7 +65,7 @@ export function DocumentPanel({ conversationId, ensureConversation, selected, on
     onDrop={e => { e.preventDefault(); setDragging(false); void upload(e.dataTransfer.files) }}>
     <div className="attachment-toolbar"><button type="button" className="attachment-button" disabled={disabled || uploading} onClick={() => input.current?.click()}><Paperclip size={16} />{t('attach')}</button>
       <small>{uploading ? t('uploadProgress') : t('dropFiles')}</small>
-      <input ref={input} type="file" accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp" multiple hidden aria-label={t('attach')} onChange={e => { if (e.target.files) void upload(e.target.files) }} />
+      <input ref={input} type="file" disabled={disabled || uploading} accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp" multiple hidden aria-label={t('attach')} onChange={e => { if (e.target.files) void upload(e.target.files) }} />
     </div>
     <div className="attachment-list" aria-label={t('attachments')} aria-live="polite">{documents.map(doc => <div className={`attachment attachment--${doc.status}`} key={doc.id}>
       <label><input type="checkbox" checked={selected.includes(doc.id)} disabled={disabled} aria-label={`${t('selectFile')}: ${doc.filename}`} onChange={e => onSelected(e.target.checked ? [...selected, doc.id] : selected.filter(id => id !== doc.id))} /><span><strong>{doc.filename}</strong><small>{doc.mime_type.split('/')[1]} · {(doc.size_bytes / 1024).toFixed(1)} KB · {t(doc.status)} {doc.progress}%</small></span></label>
